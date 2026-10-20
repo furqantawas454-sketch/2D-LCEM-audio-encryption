@@ -1,0 +1,2550 @@
+2D-LCEM AUDIO ENCRYPTION - ALL CODE FILES
+Each file starts after a line of '=' with its file name.
+Save each part under the given name, in one folder.
+
+==============================================================================
+FILE: lcem_map.py
+==============================================================================
+"""
+2D Logistic-Cosine Exponential Modular Map (2D-LCEM)
+=====================================================
+
+    x_{n+1} = { 2^k (a + 1) x_n (1 - x_n) + exp( cos(pi * y_n) )     }  mod 1
+    y_{n+1} = { 2^k (b + 1) y_n (1 - y_n) + exp( sin(pi * x_{n+1}) ) }  mod 1
+
+  Control parameters : a >= 0, b >= 0
+  Scaling exponent   : integer k >= 6 (recommended default k = 10)
+  State space        : [0, 1) x [0, 1)
+
+Design ideas
+  * 2^k (a+1) x(1-x)   : an amplified logistic term -> strong stretching in x
+  * exp(cos(pi y))     : a bounded exponential-trigonometric coupling term with
+                         range [1/e, e] (width > 2), so after "mod 1" it can push
+                         x anywhere in [0,1) -> strong cross-mixing
+  * using x_{n+1} inside the y-equation  -> sequential (tight) coupling
+  * mod 1              : folding that keeps the orbit bounded for EVERY a, b >= 0
+  * (a + 1)            : guarantees the stretching factor never vanishes, so the
+                         map has no non-chaotic "dead" region at a = 0 or b = 0
+
+Jacobian (mod 1 has derivative 1 almost everywhere):
+    J11 = 2^k (a+1)(1 - 2x)
+    J12 = -pi sin(pi y) exp(cos(pi y))
+    J21 = g(x') * J11,             g(u) = pi cos(pi u) exp(sin(pi u))
+    J22 = 2^k (b+1)(1 - 2y) + g(x') * J12
+    det J = 2^{2k} (a+1)(b+1)(1 - 2x)(1 - 2y)      (coupling terms cancel)
+
+All functions are vectorised: a, b, x, y may be numpy arrays of equal shape.
+"""
+import math
+import numpy as np
+
+PI = np.pi
+DEFAULT_K = 10
+
+
+def lcem_step(x, y, a, b, k=DEFAULT_K):
+    """One iteration of 2D-LCEM (numpy-vectorised)."""
+    A = 2.0 ** k * (a + 1.0)
+    B = 2.0 ** k * (b + 1.0)
+    x_new = np.mod(A * x * (1.0 - x) + np.exp(np.cos(PI * y)), 1.0)
+    y_new = np.mod(B * y * (1.0 - y) + np.exp(np.sin(PI * x_new)), 1.0)
+    return x_new, y_new
+
+
+def lcem_jacobian(x, y, a, b, k=DEFAULT_K):
+    """Return (J11, J12, J21, J22, x_new, y_new) at the point (x, y)."""
+    A = 2.0 ** k * (a + 1.0)
+    B = 2.0 ** k * (b + 1.0)
+    x_new, y_new = lcem_step(x, y, a, b, k)
+    J11 = A * (1.0 - 2.0 * x)
+    J12 = -PI * np.sin(PI * y) * np.exp(np.cos(PI * y))
+    g = PI * np.cos(PI * x_new) * np.exp(np.sin(PI * x_new))
+    J21 = g * J11
+    J22 = B * (1.0 - 2.0 * y) + g * J12
+    return J11, J12, J21, J22, x_new, y_new
+
+
+def lcem_sequence(x0, y0, a, b, k=DEFAULT_K, n=10000, discard=1000):
+    """Generate n orbit points (fast scalar loop) after discarding transients."""
+    A = 2.0 ** k * (a + 1.0)
+    B = 2.0 ** k * (b + 1.0)
+    x, y = float(x0), float(y0)
+    cos, sin, exp, pi = math.cos, math.sin, math.exp, math.pi
+    for _ in range(discard):
+        x = (A * x * (1.0 - x) + exp(cos(pi * y))) % 1.0
+        y = (B * y * (1.0 - y) + exp(sin(pi * x))) % 1.0
+    xs = np.empty(n)
+    ys = np.empty(n)
+    for i in range(n):
+        x = (A * x * (1.0 - x) + exp(cos(pi * y))) % 1.0
+        y = (B * y * (1.0 - y) + exp(sin(pi * x))) % 1.0
+        xs[i] = x
+        ys[i] = y
+    return xs, ys
+
+
+def lyapunov_2d(jac_fn, a, b, x0=0.31, y0=0.47, n=5000, discard=500, **kw):
+    """Both Lyapunov exponents of a 2D map by QR (Gram-Schmidt) re-orthonormalisation.
+
+    jac_fn(x, y, a, b, **kw) -> (J11, J12, J21, J22, x_new, y_new).
+    a and b may be arrays: all parameter values are iterated in parallel.
+    Returns (LE1, LE2) arrays (unsorted; LE1 is the largest in practice).
+    """
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    shape = np.broadcast(a, b).shape
+    a = np.broadcast_to(a, shape)
+    b = np.broadcast_to(b, shape)
+    x = np.full(shape, x0)
+    y = np.full(shape, y0)
+    with np.errstate(all="ignore"):
+        for _ in range(discard):
+            _, _, _, _, x, y = jac_fn(x, y, a, b, **kw)
+        q11 = np.ones(shape); q21 = np.zeros(shape)
+        q12 = np.zeros(shape); q22 = np.ones(shape)
+        s1 = np.zeros(shape); s2 = np.zeros(shape)
+        tiny = 1e-300
+        for _ in range(n):
+            J11, J12, J21, J22, x, y = jac_fn(x, y, a, b, **kw)
+            m11 = J11 * q11 + J12 * q21
+            m21 = J21 * q11 + J22 * q21
+            m12 = J11 * q12 + J12 * q22
+            m22 = J21 * q12 + J22 * q22
+            r11 = np.sqrt(m11 ** 2 + m21 ** 2) + tiny
+            q11 = m11 / r11; q21 = m21 / r11
+            proj = q11 * m12 + q21 * m22
+            v1 = m12 - proj * q11
+            v2 = m22 - proj * q21
+            r22 = np.sqrt(v1 ** 2 + v2 ** 2) + tiny
+            q12 = v1 / r22; q22 = v2 / r22
+            s1 += np.log(r11)
+            s2 += np.log(r22)
+    return s1 / n, s2 / n
+
+
+if __name__ == "__main__":
+    xs, ys = lcem_sequence(0.31, 0.47, a=2.0, b=3.0)
+    print("first 5 x:", xs[:5])
+    print("first 5 y:", ys[:5])
+    l1, l2 = lyapunov_2d(lcem_jacobian, 2.0, 3.0, n=20000)
+    print("Lyapunov exponents at a=2, b=3, k=10:", float(l1), float(l2))
+
+==============================================================================
+FILE: nist_tests.py
+==============================================================================
+"""
+A subset of the NIST SP 800-22 Rev. 1a statistical tests, implemented from the
+formulas in the specification. Input: a numpy array of 0/1 integers.
+Each function returns a list of P-values (most return one).
+"""
+import math
+import numpy as np
+from scipy.special import gammaincc, erfc
+from scipy.stats import norm
+
+
+def frequency(bits):
+    n = bits.size
+    s = np.sum(2 * bits.astype(np.int64) - 1)
+    return [erfc(abs(s) / math.sqrt(n) / math.sqrt(2))]
+
+
+def block_frequency(bits, M=128):
+    n = bits.size
+    N = n // M
+    blocks = bits[: N * M].reshape(N, M)
+    pi = blocks.mean(axis=1)
+    chi2 = 4 * M * np.sum((pi - 0.5) ** 2)
+    return [gammaincc(N / 2, chi2 / 2)]
+
+
+def _cusum_p(n, z):
+    k1 = np.arange(math.floor((-n / z + 1) / 4), math.floor((n / z - 1) / 4) + 1)
+    k2 = np.arange(math.floor((-n / z - 3) / 4), math.floor((n / z - 1) / 4) + 1)
+    sq = math.sqrt(n)
+    s1 = np.sum(norm.cdf((4 * k1 + 1) * z / sq) - norm.cdf((4 * k1 - 1) * z / sq))
+    s2 = np.sum(norm.cdf((4 * k2 + 3) * z / sq) - norm.cdf((4 * k2 + 1) * z / sq))
+    return 1 - s1 + s2
+
+
+def cumulative_sums(bits):
+    x = 2 * bits.astype(np.int64) - 1
+    n = x.size
+    zf = np.max(np.abs(np.cumsum(x)))
+    zb = np.max(np.abs(np.cumsum(x[::-1])))
+    return [_cusum_p(n, zf), _cusum_p(n, zb)]
+
+
+def runs(bits):
+    n = bits.size
+    pi = bits.mean()
+    if abs(pi - 0.5) >= 2 / math.sqrt(n):
+        return [0.0]
+    v = 1 + np.count_nonzero(bits[1:] != bits[:-1])
+    return [erfc(abs(v - 2 * n * pi * (1 - pi)) / (2 * math.sqrt(2 * n) * pi * (1 - pi)))]
+
+
+def longest_run(bits):
+    """Longest run of ones in a block, M = 10^4 (requires n >= 750000)."""
+    M, K, N = 10000, 6, 75
+    pis = [0.0882, 0.2092, 0.2483, 0.1933, 0.1208, 0.0675, 0.0727]
+    blocks = bits[: N * M].reshape(N, M)
+    counts = np.zeros(K + 1)
+    for blk in blocks:
+        padded = np.concatenate(([0], blk, [0]))
+        d = np.diff(padded)
+        starts = np.flatnonzero(d == 1)
+        ends = np.flatnonzero(d == -1)
+        longest = int(np.max(ends - starts)) if starts.size else 0
+        idx = min(max(longest, 10), 16) - 10
+        counts[idx] += 1
+    chi2 = np.sum((counts - N * np.array(pis)) ** 2 / (N * np.array(pis)))
+    return [gammaincc(K / 2, chi2 / 2)]
+
+
+def _block_counts(bits, m):
+    """Counts of all overlapping m-bit patterns, with wrap-around."""
+    n = bits.size
+    ext = np.concatenate((bits, bits[: m - 1])).astype(np.int64)
+    val = np.zeros(n, dtype=np.int64)
+    for j in range(m):
+        val = (val << 1) | ext[j: j + n]
+    return np.bincount(val, minlength=2 ** m)
+
+
+def _psi2(bits, m):
+    if m <= 0:
+        return 0.0
+    n = bits.size
+    c = _block_counts(bits, m).astype(np.float64)
+    return (2 ** m / n) * np.sum(c ** 2) - n
+
+
+def serial(bits, m=16):
+    p0, p1, p2 = _psi2(bits, m), _psi2(bits, m - 1), _psi2(bits, m - 2)
+    d1 = p0 - p1
+    d2 = p0 - 2 * p1 + p2
+    return [gammaincc(2 ** (m - 2), d1 / 2), gammaincc(2 ** (m - 3), d2 / 2)]
+
+
+def approximate_entropy(bits, m=10):
+    n = bits.size
+
+    def phi(mm):
+        c = _block_counts(bits, mm).astype(np.float64) / n
+        c = c[c > 0]
+        return np.sum(c * np.log(c))
+
+    apen = phi(m) - phi(m + 1)
+    chi2 = 2 * n * (math.log(2) - apen)
+    return [gammaincc(2 ** (m - 1), chi2 / 2)]
+
+
+TESTS = {
+    "Frequency (monobit)": frequency,
+    "Block frequency (M=128)": block_frequency,
+    "Cumulative sums": cumulative_sums,
+    "Runs": runs,
+    "Longest run of ones (M=10^4)": longest_run,
+    "Serial (m=16)": serial,
+    "Approximate entropy (m=10)": approximate_entropy,
+}
+
+
+def run_battery(sequences, alpha=0.01):
+    """Apply every test to every sequence. Returns {test: (pass proportion, P_T uniformity)}
+    following NIST's proportion and P-value uniformity criteria."""
+    results = {}
+    for name, fn in TESTS.items():
+        pvals = []
+        for bits in sequences:
+            pvals.append(fn(bits))
+        pvals = np.array(pvals)                      # shape (num_seq, num_subtests)
+        props, pts = [], []
+        for j in range(pvals.shape[1]):
+            p = pvals[:, j]
+            props.append(np.mean(p >= alpha))
+            counts = np.histogram(p, bins=10, range=(0, 1))[0]
+            s = len(p)
+            chi2 = np.sum((counts - s / 10) ** 2 / (s / 10))
+            pts.append(gammaincc(9 / 2, chi2 / 2))
+        results[name] = (min(props), min(pts))
+    return results
+
+==============================================================================
+FILE: paper_figures.py
+==============================================================================
+"""
+All numerical results and figures for the 2D-LCEM paper (journal style:
+no titles inside figures, panel labels (a), (b), ...).
+Writes figures to ./fig and numbers to ./paper_results.txt
+"""
+import os
+import math
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy import stats
+
+from lcem_map import lcem_step, lcem_jacobian, lcem_sequence, lyapunov_2d, PI
+from nist_tests import run_battery
+
+K = 10
+DISC = 1000
+OUT = "fig"
+os.makedirs(OUT, exist_ok=True)
+lines = []
+
+
+def log(s=""):
+    print(s, flush=True)
+    lines.append(s)
+
+
+C = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]
+INK, INK2, GRID = "#1f2328", "#59636e", "#e4e7eb"
+plt.rcParams.update({
+    "font.size": 10, "font.family": "serif", "mathtext.fontset": "cm",
+    "axes.edgecolor": "#8a9099", "axes.labelcolor": INK,
+    "xtick.color": INK, "ytick.color": INK, "axes.grid": True,
+    "grid.color": GRID, "grid.linewidth": 0.6, "axes.spines.top": False,
+    "axes.spines.right": False, "figure.dpi": 150, "savefig.bbox": "tight",
+    "savefig.dpi": 300, "lines.linewidth": 1.4, "legend.frameon": False,
+})
+
+
+def panel(ax, s, y=1.03):
+    ax.text(-0.02, y, s, transform=ax.transAxes, ha="right", va="bottom",
+            fontweight="bold", fontsize=11, color=INK)
+
+
+# ------------------------------------------------------------------ reference maps
+def slmm_jac(x, y, a, b):
+    xn = a * (np.sin(PI * y) + b) * x * (1 - x)
+    yn = a * (np.sin(PI * xn) + b) * y * (1 - y)
+    J11 = a * (np.sin(PI * y) + b) * (1 - 2 * x)
+    J12 = a * PI * np.cos(PI * y) * x * (1 - x)
+    h = a * PI * np.cos(PI * xn) * y * (1 - y)
+    return J11, J12, h * J11, a * (np.sin(PI * xn) + b) * (1 - 2 * y) + h * J12, xn, yn
+
+
+def lscm_jac(x, y, th, _unused=None):
+    u = 4 * th * x * (1 - x) + (1 - th) * np.sin(PI * y)
+    xn = np.sin(PI * u)
+    J11 = PI * np.cos(PI * u) * 4 * th * (1 - 2 * x)
+    J12 = PI * np.cos(PI * u) * (1 - th) * PI * np.cos(PI * y)
+    v = 4 * th * y * (1 - y) + (1 - th) * np.sin(PI * xn)
+    yn = np.sin(PI * v)
+    dv = (1 - th) * PI * np.cos(PI * xn)
+    return J11, J12, PI * np.cos(PI * v) * dv * J11, PI * np.cos(PI * v) * (4 * th * (1 - 2 * y) + dv * J12), xn, yn
+
+
+def henon_jac(x, y, a, b):
+    return -2 * a * x, np.ones_like(x), b * np.ones_like(x), np.zeros_like(x), 1 - a * x * x + y, b * x
+
+
+def le_1d(f, df, r, x0=0.31, n=5000, discard=DISC):
+    x = np.full_like(r, x0)
+    with np.errstate(all="ignore"):
+        for _ in range(discard):
+            x = f(x, r)
+        s = np.zeros_like(r)
+        for _ in range(n):
+            s += np.log(np.abs(df(x, r)) + 1e-300)
+            x = f(x, r)
+    return s / n
+
+
+logistic_f = lambda x, r: r * x * (1 - x)
+logistic_df = lambda x, r: r * (1 - 2 * x)
+sine_f = lambda x, r: r * np.sin(PI * x)
+sine_df = lambda x, r: r * PI * np.cos(PI * x)
+
+
+def orbit_2d(jac, a, b, x0, y0, n, discard=DISC):
+    x, y = np.float64(x0), np.float64(y0)
+    for _ in range(discard):
+        *_, x, y = jac(x, y, a, b)
+    xs, ys = np.empty(n), np.empty(n)
+    for i in range(n):
+        *_, x, y = jac(x, y, a, b)
+        xs[i], ys[i] = x, y
+    return xs, ys
+
+
+def orbit_1d(f, r, x0, n, discard=DISC):
+    x = x0
+    for _ in range(discard):
+        x = f(x, r)
+    out = np.empty(n)
+    for i in range(n):
+        x = f(x, r)
+        out[i] = x
+    return out
+
+
+def sample_entropy(s, m=2, r_frac=0.2):
+    s = np.asarray(s, float)
+    r = r_frac * s.std()
+    if r == 0:
+        return 0.0
+    N = len(s)
+
+    def count(mm):
+        emb = np.lib.stride_tricks.sliding_window_view(s, mm)[: N - m]
+        d = np.max(np.abs(emb[:, None, :] - emb[None, :, :]), axis=2)
+        return (np.sum(d <= r) - len(emb)) / 2
+
+    B, A = count(m), count(m + 1)
+    if A == 0 or B == 0:
+        return np.nan
+    return -math.log(A / B)
+
+
+def permutation_entropy(s, order=5):
+    """Normalised permutation entropy (Bandt-Pompe), delay 1."""
+    emb = np.lib.stride_tricks.sliding_window_view(np.asarray(s, float), order)
+    ranks = np.argsort(emb, axis=1, kind="stable")
+    codes = np.zeros(len(ranks), dtype=np.int64)
+    for j in range(order):
+        codes = codes * order + ranks[:, j]
+    _, counts = np.unique(codes, return_counts=True)
+    p = counts / counts.sum()
+    return float(-(p * np.log(p)).sum() / math.log(math.factorial(order)))
+
+
+rng01 = np.random.default_rng(2026)
+
+
+def zero_one_test(phi, n_c=50):
+    phi = np.asarray(phi, float)
+    N = len(phi)
+    ncut = N // 10
+    j = np.arange(1, N + 1)
+    Ks = []
+    for c in rng01.uniform(PI / 5, 4 * PI / 5, n_c):
+        p = np.cumsum(phi * np.cos(j * c))
+        q = np.cumsum(phi * np.sin(j * c))
+        ns = np.arange(1, ncut + 1)
+        M = np.array([np.mean((p[k:] - p[:-k]) ** 2 + (q[k:] - q[:-k]) ** 2) for k in ns])
+        D = M - (phi.mean() ** 2) * (1 - np.cos(ns * c)) / (1 - np.cos(c))
+        Ks.append(np.corrcoef(ns, D)[0, 1])
+    return float(np.median(Ks))
+
+
+log(f"2D-LCEM paper results (k = {K}, transient = {DISC})")
+log("=" * 64)
+
+# ================================================================ Fig 1
+NP, KEEP, NLE = 1500, 200, 801
+p = np.linspace(0, 4, NP)
+bif = {}
+for vary in ["a", "b"]:
+    a = p if vary == "a" else np.full_like(p, 2.0)
+    b = p if vary == "b" else np.full_like(p, 2.0)
+    x = np.full_like(p, 0.31); y = np.full_like(p, 0.47)
+    for _ in range(DISC):
+        x, y = lcem_step(x, y, a, b, K)
+    px = np.empty((KEEP, NP)); py = np.empty((KEEP, NP))
+    for i in range(KEEP):
+        x, y = lcem_step(x, y, a, b, K)
+        px[i], py[i] = x, y
+    bif[vary] = (px, py)
+pl = np.linspace(0, 4, NLE)
+les = {}
+for vary in ["a", "b"]:
+    if vary == "a":
+        l1, l2 = lyapunov_2d(lcem_jacobian, pl, 2.0, n=8000, discard=DISC, k=K)
+    else:
+        l1, l2 = lyapunov_2d(lcem_jacobian, 2.0, pl, n=8000, discard=DISC, k=K)
+    les[vary] = (np.maximum(l1, l2), np.minimum(l1, l2))
+    L1, L2 = les[vary]
+    log(f"[Fig1] vary {vary} (other = 2): LE1 in [{L1.min():.3f}, {L1.max():.3f}], "
+        f"LE2 in [{L2.min():.3f}, {L2.max():.3f}], both > 0 at {np.sum((L1 > 0) & (L2 > 0))}/{NLE}")
+
+fig, axs = plt.subplots(3, 2, figsize=(11, 10))
+for col, v in enumerate(["a", "b"]):
+    px, py = bif[v]
+    for row, (pts, var, colr) in enumerate([(px, "x", C[0]), (py, "y", C[1])]):
+        ax = axs[row, col]
+        ax.plot(np.tile(p, KEEP), pts.ravel(), ",", color=colr, alpha=0.3)
+        ax.set(xlim=(0, 4), ylim=(0, 1), xlabel=f"${v}$", ylabel=f"${var}$")
+        ax.grid(False)
+    ax = axs[2, col]
+    L1, L2 = les[v]
+    ax.plot(pl, L1, color=C[0], label=r"$\lambda_1$")
+    ax.plot(pl, L2, color=C[1], label=r"$\lambda_2$")
+    ax.axhline(0, color=INK2, lw=0.8)
+    ax.set(xlim=(0, 4), ylim=(-0.5, 8.5), xlabel=f"${v}$", ylabel="Lyapunov exponent")
+    ax.legend(loc="lower right")
+for ax, s in zip(axs.ravel(), "abcdef"):
+    panel(ax, f"({s})")
+fig.tight_layout()
+fig.savefig(f"{OUT}/fig_bifurcation_lyapunov.png"); plt.close(fig)
+
+# ================================================================ Fig 2: (a,b) plane
+g = np.linspace(0, 4, 201)
+GA, GB = np.meshgrid(g, g)
+M1, M2 = lyapunov_2d(lcem_jacobian, GA, GB, n=4000, discard=DISC, k=K)
+P1, P2 = np.maximum(M1, M2), np.minimum(M1, M2)
+i1 = np.unravel_index(P1.argmin(), P1.shape); i2 = np.unravel_index(P2.argmin(), P2.shape)
+log(f"[Fig2] (a,b) in [0,4]^2, 201x201, n=4000: min LE1 = {P1.min():.3f} at (a,b)=({GA[i1]:.2f},{GB[i1]:.2f}); "
+    f"min LE2 = {P2.min():.3f} at ({GA[i2]:.2f},{GB[i2]:.2f}); max LE1 = {P1.max():.3f}; "
+    f"hyperchaotic fraction = {np.mean(P2 > 0):.4f}")
+gw = np.linspace(0, 100, 101)
+WA, WB = np.meshgrid(gw, gw)
+W1, W2 = lyapunov_2d(lcem_jacobian, WA, WB, n=3000, discard=DISC, k=K)
+log(f"[Fig2] (a,b) in [0,100]^2, 101x101, n=3000: min LE2 = {np.minimum(W1, W2).min():.3f}, "
+    f"max LE1 = {np.maximum(W1, W2).max():.3f}, hyperchaotic fraction = {np.mean(np.minimum(W1, W2) > 0):.4f}")
+fig, axs = plt.subplots(1, 2, figsize=(11, 4.3))
+for ax, Z, lab, s in [(axs[0], P1, r"$\lambda_1$", "(a)"), (axs[1], P2, r"$\lambda_2$", "(b)")]:
+    im = ax.imshow(Z, origin="lower", extent=[0, 4, 0, 4], cmap="Blues", aspect="auto")
+    cb = fig.colorbar(im, ax=ax); cb.set_label(lab)
+    ax.set(xlabel="$a$", ylabel="$b$"); ax.grid(False)
+    panel(ax, s)
+fig.tight_layout()
+fig.savefig(f"{OUT}/fig_le_plane.png"); plt.close(fig)
+
+# ================================================================ Fig 3: LE vs k
+ks = np.arange(1, 13)
+fig, axs = plt.subplots(1, 2, figsize=(11, 4), sharey=True)
+log("[Fig3] Lyapunov exponents versus k (n = 20000):")
+for ax, av, s in [(axs[0], 0.0, "(a)"), (axs[1], 2.0, "(b)")]:
+    r1, r2 = [], []
+    for k in ks:
+        l1, l2 = lyapunov_2d(lcem_jacobian, av, av, n=20000, discard=DISC, k=int(k))
+        r1.append(max(float(l1), float(l2))); r2.append(min(float(l1), float(l2)))
+    r1, r2 = np.array(r1), np.array(r2)
+    formula = 2 * ks * math.log(2) + 2 * math.log(av + 1) - 2
+    for k, u, v, f in zip(ks, r1, r2, formula):
+        log(f"   a=b={av:g} k={k:2d}: LE1={u:8.4f} LE2={v:8.4f} sum={u + v:8.4f} Eq.={f:8.4f}")
+    ax.plot(ks, r1, "o-", color=C[0], ms=4, label=r"$\lambda_1$")
+    ax.plot(ks, r2, "s-", color=C[1], ms=4, label=r"$\lambda_2$")
+    ax.plot(ks, r1 + r2, "^", color=C[2], ms=5, label=r"$\lambda_1+\lambda_2$ (numerical)")
+    ax.plot(ks, formula, "--", color=INK2, label="Corollary estimate")
+    ax.axhline(0, color=INK2, lw=0.8)
+    ax.set(xlabel="$k$", xticks=ks)
+    panel(ax, s)
+axs[0].set_ylabel("Lyapunov exponent")
+axs[0].legend(loc="upper left", fontsize=9)
+fig.tight_layout()
+fig.savefig(f"{OUT}/fig_le_vs_k.png"); plt.close(fig)
+
+# ================================================================ LE-sum table at k=10
+log("[Table] LE sum at k=10 (n = 30000):")
+for aa, bb in [(0.0, 0.0), (1.0, 3.0), (2.0, 2.0), (4.0, 4.0), (10.0, 0.5), (50.0, 50.0)]:
+    u, v = lyapunov_2d(lcem_jacobian, aa, bb, n=30000, discard=DISC, k=K)
+    th = 2 * K * math.log(2) + math.log(aa + 1) + math.log(bb + 1) - 2
+    log(f"   (a,b)=({aa:g},{bb:g}): LE1={max(float(u), float(v)):.4f} LE2={min(float(u), float(v)):.4f} "
+        f"sum={float(u + v):.4f} Eq.={th:.4f} diff={abs(float(u + v) - th):.4f}")
+
+# ================================================================ Fig 4: comparison
+pn = np.linspace(0.001, 1, 400)
+le_log = le_1d(logistic_f, logistic_df, 4 * pn)
+le_sin = le_1d(sine_f, sine_df, pn)
+s1, s2 = lyapunov_2d(slmm_jac, pn, 3.0, discard=DISC); le_slmm = np.maximum(s1, s2)
+c1, c2 = lyapunov_2d(lscm_jac, pn, 0.0, discard=DISC); le_lscm = np.maximum(c1, c2)
+m1, m2 = lyapunov_2d(lcem_jacobian, 4 * pn, 4 * pn, discard=DISC, k=K); le_lcem = np.maximum(m1, m2)
+series = [("2D-LCEM, $a=b=4p$", le_lcem, C[0], 2.2),
+          (r"2D-LSCM, $\theta=p$", le_lscm, C[1], 1.3),
+          ("2D-SLMM, $a=p$, $b=3$", le_slmm, C[2], 1.3),
+          ("Sine map, $r=p$", le_sin, C[3], 1.3),
+          ("Logistic map, $r=4p$", le_log, C[4], 1.3)]
+fig, ax = plt.subplots(figsize=(8, 4.2))
+for name, v, col, lw in series:
+    ax.plot(pn, np.clip(v, -4, None), color=col, lw=lw, label=name)
+ax.axhline(0, color=INK2, lw=0.8)
+ax.set(xlabel="normalised parameter $p$", ylabel=r"largest Lyapunov exponent $\lambda_1$", ylim=(-4, 9))
+ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.17), ncol=3, fontsize=9)
+fig.savefig(f"{OUT}/fig_le_comparison.png"); plt.close(fig)
+log("[Fig4] largest LE over p in (0,1] (400 values): name, max, min, fraction > 0")
+for name, v, *_ in series:
+    log(f"   {name:28s} max {np.nanmax(v):7.3f}  min {np.nanmin(v):8.3f}  frac>0 {np.mean(v > 0):.3f}")
+
+# ================================================================ Fig 5: phase portraits
+NPH = 30000
+lx, ly = lcem_sequence(0.31, 0.47, 2.0, 3.0, n=NPH, discard=DISC, k=K)
+sx, sy = orbit_2d(slmm_jac, 0.9, 3.0, 0.31, 0.47, NPH)
+cx, cy = orbit_2d(lscm_jac, 0.9, 0.0, 0.31, 0.47, NPH)
+hx, hy = orbit_2d(henon_jac, 1.4, 0.3, 0.1, 0.1, NPH)
+fig, axs = plt.subplots(1, 4, figsize=(15, 3.9))
+for ax, (u, v), col, s in zip(axs, [(lx, ly), (sx, sy), (cx, cy), (hx, hy)],
+                              [C[0], C[2], C[1], INK2], "abcd"):
+    ax.plot(u, v, ",", color=col, alpha=0.5)
+    ax.set(xlabel="$x$", ylabel="$y$"); ax.grid(False)
+    panel(ax, f"({s})")
+for ax in axs[:3]:
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+fig.tight_layout()
+fig.savefig(f"{OUT}/fig_phase.png"); plt.close(fig)
+
+# ================================================================ Fig 6: sensitivity
+NS = 40
+xa, _ = lcem_sequence(0.31, 0.47, 2.0, 3.0, n=NS, discard=0, k=K)
+xb, _ = lcem_sequence(0.31 + 1e-15, 0.47, 2.0, 3.0, n=NS, discard=0, k=K)
+dx = np.abs(xa - xb)
+first = int(np.argmax(dx > 1e-2)) + 1
+log(f"[Fig6] x0 vs x0+1e-15 (a=2,b=3,y0=0.47): |dx_n| for n=1..8 = "
+    + ", ".join(f"{d:.2e}" for d in dx[:8]) + f"; first n with |dx|>0.01: {first}")
+fig, axs = plt.subplots(1, 2, figsize=(12, 3.8), gridspec_kw={"width_ratios": [1.7, 1]})
+it = np.arange(1, NS + 1)
+axs[0].plot(it, xa, color=C[0], marker="o", ms=3.5, label=r"$x_0=0.31$")
+axs[0].plot(it, xb, color=C[1], marker="s", ms=3.5, ls="--", label=r"$x_0=0.31+10^{-15}$")
+axs[0].set(xlabel="$n$", ylabel="$x_n$")
+axs[0].legend(loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=2)
+axs[1].semilogy(it[:15], np.maximum(dx[:15], 1e-18), "o-", color=C[0], ms=3.5)
+axs[1].set(xlabel="$n$", ylabel=r"$|x_n-\tilde{x}_n|$")
+panel(axs[0], "(a)"); panel(axs[1], "(b)")
+fig.tight_layout()
+fig.savefig(f"{OUT}/fig_sensitivity.png"); plt.close(fig)
+
+# ================================================================ Fig 7: complexity
+pe_grid = np.linspace(0.01, 1, 40)
+NSE, NPE = 1500, 10000
+names = ["2D-LCEM", "2D-LSCM", "2D-SLMM", "Sine map", "Logistic map"]
+SE = {k_: [] for k_ in names}; PE = {k_: [] for k_ in names}
+for pv in pe_grid:
+    seqs = {
+        "2D-LCEM": lcem_sequence(0.31, 0.47, 4 * pv, 4 * pv, n=NPE, discard=DISC, k=K)[0],
+        "2D-LSCM": orbit_2d(lscm_jac, pv, 0.0, 0.31, 0.47, NPE)[0],
+        "2D-SLMM": orbit_2d(slmm_jac, pv, 3.0, 0.31, 0.47, NPE)[0],
+        "Sine map": orbit_1d(lambda x, r: r * math.sin(math.pi * x), pv, 0.31, NPE),
+        "Logistic map": orbit_1d(lambda x, r: r * x * (1 - x), 4 * pv, 0.31, NPE),
+    }
+    for nm, sq in seqs.items():
+        SE[nm].append(sample_entropy(sq[:NSE]))
+        PE[nm].append(permutation_entropy(sq, 5))
+K01 = [zero_one_test(lcem_sequence(0.31, 0.47, av, 2.0, n=2000, discard=DISC, k=K)[0])
+       for av in np.linspace(0, 4, 25)]
+log(f"[Fig7] sample entropy (m=2, r=0.2 sd, N={NSE}) and permutation entropy (order 5, N={NPE}), 40 values of p:")
+for nm in names:
+    log(f"   {nm:14s} SE mean {np.nanmean(SE[nm]):.3f} min {np.nanmin(SE[nm]):.3f} | "
+        f"PE mean {np.mean(PE[nm]):.4f} min {np.min(PE[nm]):.4f}")
+rnd = np.random.default_rng(5).random(NPE)
+log(f"   reference i.i.d. uniform: SE {sample_entropy(rnd[:NSE]):.3f}, PE {permutation_entropy(rnd, 5):.4f}")
+log(f"[Fig7] 0-1 test, x-series N=2000, 25 values a in [0,4], b=2: min K = {min(K01):.4f}, "
+    f"max K = {max(K01):.4f}, mean = {np.mean(K01):.4f}")
+fig, axs = plt.subplots(1, 3, figsize=(15, 3.9))
+for nm, col in zip(names, C):
+    lw = 2.2 if nm == "2D-LCEM" else 1.3
+    axs[0].plot(pe_grid, np.nan_to_num(SE[nm]), color=col, lw=lw, label=nm)
+    axs[1].plot(pe_grid, PE[nm], color=col, lw=lw, label=nm)
+axs[0].set(xlabel="$p$", ylabel="sample entropy")
+axs[1].set(xlabel="$p$", ylabel="normalised permutation entropy", ylim=(0, 1.05))
+axs[2].plot(np.linspace(0, 4, 25), K01, color=C[0], marker="o", ms=4)
+axs[2].set(xlabel="$a$  ($b=2$)", ylabel="$K$", ylim=(-0.05, 1.05))
+for ax, s in zip(axs, "abc"):
+    panel(ax, f"({s})")
+fig.tight_layout(rect=(0, 0.08, 1, 1))
+h, l = axs[0].get_legend_handles_labels()
+fig.legend(h, l, loc="lower center", ncol=5, fontsize=9)
+fig.savefig(f"{OUT}/fig_complexity.png"); plt.close(fig)
+
+# ================================================================ Fig 8: distribution, correlation
+xs, ys = lcem_sequence(0.31, 0.47, 2.0, 3.0, n=200000, discard=DISC, k=K)
+fig, axs = plt.subplots(1, 2, figsize=(11, 3.4), sharey=True)
+for ax, sq, lab, s in [(axs[0], xs, "x", "(a)"), (axs[1], ys, "y", "(b)")]:
+    ax.hist(sq, bins=100, color=C[0], edgecolor="white", linewidth=0.3)
+    ax.set(xlabel=f"${lab}$")
+    panel(ax, s)
+axs[0].set_ylabel("count")
+fig.tight_layout()
+fig.savefig(f"{OUT}/fig_histogram.png"); plt.close(fig)
+crit = stats.chi2.ppf(0.95, 255)
+for sq, lab in [(xs, "x"), (ys, "y")]:
+    c2, pv = stats.chisquare(np.histogram(sq, 256, (0, 1))[0])
+    log(f"[Stat] chi-square {lab} (a=2,b=3, 2e5, 256 bins): {c2:.2f}, p={pv:.4f}, crit5%={crit:.2f}")
+se_c = 1 / math.sqrt(len(xs))
+log(f"[Stat] corr x_n,x_n+1 {np.corrcoef(xs[:-1], xs[1:])[0, 1]:+.5f}; y_n,y_n+1 {np.corrcoef(ys[:-1], ys[1:])[0, 1]:+.5f}; "
+    f"x_n,y_n {np.corrcoef(xs, ys)[0, 1]:+.5f}; standard error ~ {se_c:.5f}")
+
+log("[Stat] chi-square pass rate vs k (100 sequences of 1e5, random (a,b) in [0,4]^2):")
+for k in [6, 8, 10, 12]:
+    r = np.random.default_rng(100 + k); ps = []
+    for aa, bb in r.uniform(0, 4, (50, 2)):
+        u, v = lcem_sequence(r.random(), r.random(), aa, bb, k=k, n=100000, discard=DISC)
+        ps += [stats.chisquare(np.histogram(u, 256, (0, 1))[0])[1],
+               stats.chisquare(np.histogram(v, 256, (0, 1))[0])[1]]
+    ps = np.array(ps)
+    log(f"   k={k:2d}: {np.sum(ps > 0.05)}/100 pass at 5%; KS test of p-values: p={stats.kstest(ps, 'uniform').pvalue:.3g}")
+
+# ================================================================ NIST
+log("[NIST] 100 sequences of 1e6 bits; s_i = (floor(1e14 x_i)+floor(1e14 y_i)) mod 2^16; random keys:")
+r = np.random.default_rng(77)
+seqs = []
+for _ in range(100):
+    aa, bb = r.uniform(0, 4, 2)
+    u, v = lcem_sequence(r.random(), r.random(), aa, bb, n=62500, discard=DISC, k=K)
+    w = ((np.floor(u * 1e14).astype(np.int64) + np.floor(v * 1e14).astype(np.int64)) % 65536).astype(">u2")
+    seqs.append(np.unpackbits(w.view(np.uint8)).astype(np.int64))
+res = run_battery(seqs)
+thr = 0.99 - 3 * math.sqrt(0.99 * 0.01 / 100)
+for name, (prop, pt) in res.items():
+    ok = prop >= thr and pt >= 1e-4
+    log(f"   {name:30s} proportion {prop:.2f}  P_T {pt:.4f}  {'pass' if ok else 'FAIL'}")
+log(f"   (acceptance: proportion >= {thr:.4f}, P_T >= 0.0001)")
+
+# ================================================================ period search
+x, y = 0.31, 0.47
+A = 2.0 ** K * 3.0; B = 2.0 ** K * 4.0
+seen = set(); rep = None
+for i in range(1_000_000):
+    x = (A * x * (1 - x) + math.exp(math.cos(math.pi * y))) % 1.0
+    y = (B * y * (1 - y) + math.exp(math.sin(math.pi * x))) % 1.0
+    if (x, y) in seen:
+        rep = i; break
+    seen.add((x, y))
+log("[Stat] period search a=2,b=3,(0.31,0.47), 1e6 iterations: " + ("no repeated state" if rep is None else f"repeat at {rep}"))
+
+open("paper_results.txt", "w").write("\n".join(lines) + "\n")
+log("done")
+
+==============================================================================
+FILE: redraw_dense.py
+==============================================================================
+"""
+All numerical results and figures for the 2D-LCEM paper (journal style:
+no titles inside figures, panel labels (a), (b), ...).
+Writes figures to ./fig and numbers to ./paper_results.txt
+"""
+import os
+import math
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy import stats
+
+from lcem_map import lcem_step, lcem_jacobian, lcem_sequence, lyapunov_2d, PI
+from nist_tests import run_battery
+
+K = 10
+DISC = 1000
+OUT = "fig"
+os.makedirs(OUT, exist_ok=True)
+lines = []
+
+
+def log(s=""):
+    print(s, flush=True)
+    lines.append(s)
+
+
+C = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]
+INK, INK2, GRID = "#1f2328", "#59636e", "#e4e7eb"
+plt.rcParams.update({
+    "font.size": 10, "font.family": "serif", "mathtext.fontset": "cm",
+    "axes.edgecolor": "#8a9099", "axes.labelcolor": INK,
+    "xtick.color": INK, "ytick.color": INK, "axes.grid": True,
+    "grid.color": GRID, "grid.linewidth": 0.6, "axes.spines.top": False,
+    "axes.spines.right": False, "figure.dpi": 150, "savefig.bbox": "tight",
+    "savefig.dpi": 300, "lines.linewidth": 1.4, "legend.frameon": False,
+})
+
+
+def panel(ax, s, y=1.03):
+    ax.text(-0.02, y, s, transform=ax.transAxes, ha="right", va="bottom",
+            fontweight="bold", fontsize=11, color=INK)
+
+
+# ------------------------------------------------------------------ reference maps
+def slmm_jac(x, y, a, b):
+    xn = a * (np.sin(PI * y) + b) * x * (1 - x)
+    yn = a * (np.sin(PI * xn) + b) * y * (1 - y)
+    J11 = a * (np.sin(PI * y) + b) * (1 - 2 * x)
+    J12 = a * PI * np.cos(PI * y) * x * (1 - x)
+    h = a * PI * np.cos(PI * xn) * y * (1 - y)
+    return J11, J12, h * J11, a * (np.sin(PI * xn) + b) * (1 - 2 * y) + h * J12, xn, yn
+
+
+def lscm_jac(x, y, th, _unused=None):
+    u = 4 * th * x * (1 - x) + (1 - th) * np.sin(PI * y)
+    xn = np.sin(PI * u)
+    J11 = PI * np.cos(PI * u) * 4 * th * (1 - 2 * x)
+    J12 = PI * np.cos(PI * u) * (1 - th) * PI * np.cos(PI * y)
+    v = 4 * th * y * (1 - y) + (1 - th) * np.sin(PI * xn)
+    yn = np.sin(PI * v)
+    dv = (1 - th) * PI * np.cos(PI * xn)
+    return J11, J12, PI * np.cos(PI * v) * dv * J11, PI * np.cos(PI * v) * (4 * th * (1 - 2 * y) + dv * J12), xn, yn
+
+
+def henon_jac(x, y, a, b):
+    return -2 * a * x, np.ones_like(x), b * np.ones_like(x), np.zeros_like(x), 1 - a * x * x + y, b * x
+
+
+def le_1d(f, df, r, x0=0.31, n=5000, discard=DISC):
+    x = np.full_like(r, x0)
+    with np.errstate(all="ignore"):
+        for _ in range(discard):
+            x = f(x, r)
+        s = np.zeros_like(r)
+        for _ in range(n):
+            s += np.log(np.abs(df(x, r)) + 1e-300)
+            x = f(x, r)
+    return s / n
+
+
+logistic_f = lambda x, r: r * x * (1 - x)
+logistic_df = lambda x, r: r * (1 - 2 * x)
+sine_f = lambda x, r: r * np.sin(PI * x)
+sine_df = lambda x, r: r * PI * np.cos(PI * x)
+
+
+def orbit_2d(jac, a, b, x0, y0, n, discard=DISC):
+    x, y = np.float64(x0), np.float64(y0)
+    for _ in range(discard):
+        *_, x, y = jac(x, y, a, b)
+    xs, ys = np.empty(n), np.empty(n)
+    for i in range(n):
+        *_, x, y = jac(x, y, a, b)
+        xs[i], ys[i] = x, y
+    return xs, ys
+
+
+def orbit_1d(f, r, x0, n, discard=DISC):
+    x = x0
+    for _ in range(discard):
+        x = f(x, r)
+    out = np.empty(n)
+    for i in range(n):
+        x = f(x, r)
+        out[i] = x
+    return out
+
+
+def sample_entropy(s, m=2, r_frac=0.2):
+    s = np.asarray(s, float)
+    r = r_frac * s.std()
+    if r == 0:
+        return 0.0
+    N = len(s)
+
+    def count(mm):
+        emb = np.lib.stride_tricks.sliding_window_view(s, mm)[: N - m]
+        d = np.max(np.abs(emb[:, None, :] - emb[None, :, :]), axis=2)
+        return (np.sum(d <= r) - len(emb)) / 2
+
+    B, A = count(m), count(m + 1)
+    if A == 0 or B == 0:
+        return np.nan
+    return -math.log(A / B)
+
+
+def permutation_entropy(s, order=5):
+    """Normalised permutation entropy (Bandt-Pompe), delay 1."""
+    emb = np.lib.stride_tricks.sliding_window_view(np.asarray(s, float), order)
+    ranks = np.argsort(emb, axis=1, kind="stable")
+    codes = np.zeros(len(ranks), dtype=np.int64)
+    for j in range(order):
+        codes = codes * order + ranks[:, j]
+    _, counts = np.unique(codes, return_counts=True)
+    p = counts / counts.sum()
+    return float(-(p * np.log(p)).sum() / math.log(math.factorial(order)))
+
+
+rng01 = np.random.default_rng(2026)
+
+
+def zero_one_test(phi, n_c=50):
+    phi = np.asarray(phi, float)
+    N = len(phi)
+    ncut = N // 10
+    j = np.arange(1, N + 1)
+    Ks = []
+    for c in rng01.uniform(PI / 5, 4 * PI / 5, n_c):
+        p = np.cumsum(phi * np.cos(j * c))
+        q = np.cumsum(phi * np.sin(j * c))
+        ns = np.arange(1, ncut + 1)
+        M = np.array([np.mean((p[k:] - p[:-k]) ** 2 + (q[k:] - q[:-k]) ** 2) for k in ns])
+        D = M - (phi.mean() ** 2) * (1 - np.cos(ns * c)) / (1 - np.cos(c))
+        Ks.append(np.corrcoef(ns, D)[0, 1])
+    return float(np.median(Ks))
+
+
+
+plt.rcParams.update({"font.size": 12, "axes.labelsize": 13, "xtick.labelsize": 11, "ytick.labelsize": 11})
+DOT = dict(ls="none", marker="o", ms=0.9, mew=0, rasterized=True)
+# ---------------- phase portraits, 2x2, larger panels, visible dots
+NPH = 30000
+lx, ly = lcem_sequence(0.31, 0.47, 2.0, 3.0, n=NPH, discard=DISC, k=K)
+sx, sy = orbit_2d(slmm_jac, 0.9, 3.0, 0.31, 0.47, NPH)
+cx, cy = orbit_2d(lscm_jac, 0.9, 0.0, 0.31, 0.47, NPH)
+hx, hy = orbit_2d(henon_jac, 1.4, 0.3, 0.1, 0.1, NPH)
+fig, axs = plt.subplots(2, 2, figsize=(10, 9.2))
+cols = ["#1d5fb4", "#0f7a52", "#c4501f", "#333333"]
+for ax, (u, v), col, s_ in zip(axs.ravel(), [(lx, ly), (sx, sy), (cx, cy), (hx, hy)], cols, "abcd"):
+    ax.plot(u, v, color=col, alpha=0.75, **DOT)
+    ax.set(xlabel="$x$", ylabel="$y$"); ax.grid(False)
+    panel(ax, f"({s_})")
+for ax in list(axs.ravel())[:3]:
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.set_aspect("equal")
+fig.tight_layout()
+fig.savefig(f"{OUT}/fig_phase.png", dpi=300); plt.close(fig)
+
+# ---------------- bifurcation + LE
+NP, KEEP, NLE = 1200, 150, 801
+p = np.linspace(0, 4, NP)
+bif = {}
+for vary in ["a", "b"]:
+    a = p if vary == "a" else np.full_like(p, 2.0)
+    b = p if vary == "b" else np.full_like(p, 2.0)
+    x = np.full_like(p, 0.31); y = np.full_like(p, 0.47)
+    for _ in range(DISC):
+        x, y = lcem_step(x, y, a, b, K)
+    px = np.empty((KEEP, NP)); py = np.empty((KEEP, NP))
+    for i in range(KEEP):
+        x, y = lcem_step(x, y, a, b, K)
+        px[i], py[i] = x, y
+    bif[vary] = (px, py)
+pl = np.linspace(0, 4, NLE)
+les = {}
+for vary in ["a", "b"]:
+    if vary == "a":
+        l1, l2 = lyapunov_2d(lcem_jacobian, pl, 2.0, n=8000, discard=DISC, k=K)
+    else:
+        l1, l2 = lyapunov_2d(lcem_jacobian, 2.0, pl, n=8000, discard=DISC, k=K)
+    les[vary] = (np.maximum(l1, l2), np.minimum(l1, l2))
+    print(vary, les[vary][0].min(), les[vary][0].max(), les[vary][1].min(), les[vary][1].max())
+fig, axs = plt.subplots(3, 2, figsize=(11, 11))
+for col, v in enumerate(["a", "b"]):
+    px, py = bif[v]
+    for row, (pts, var, colr) in enumerate([(px, "x", "#1d5fb4"), (py, "y", "#c4501f")]):
+        ax = axs[row, col]
+        ax.plot(np.tile(p, KEEP), pts.ravel(), color=colr, alpha=0.35,
+                ls="none", marker="o", ms=0.7, mew=0, rasterized=True)
+        ax.set(xlim=(0, 4), ylim=(0, 1), xlabel=f"${v}$", ylabel=f"${var}$")
+        ax.grid(False)
+    ax = axs[2, col]
+    L1, L2 = les[v]
+    ax.plot(pl, L1, color=C[0], lw=1.8, label=r"$\lambda_1$")
+    ax.plot(pl, L2, color=C[1], lw=1.8, label=r"$\lambda_2$")
+    ax.axhline(0, color=INK2, lw=0.8)
+    ax.set(xlim=(0, 4), ylim=(-0.5, 8.5), xlabel=f"${v}$", ylabel="Lyapunov exponent")
+    ax.legend(loc="lower right")
+for ax, s_ in zip(axs.ravel(), "abcdef"):
+    panel(ax, f"({s_})")
+fig.tight_layout()
+fig.savefig(f"{OUT}/fig_bifurcation_lyapunov.png", dpi=300); plt.close(fig)
+
+==============================================================================
+FILE: lcem_audio_cipher.py
+==============================================================================
+"""
+Audio encryption with the 2D-LCEM hyperchaotic map.
+
+Scheme
+  1. Key K = (x0, y0, a, b); k = 10 is fixed. SHA-256 of the audio perturbs
+     the initial values, so each file gets its own chaotic sequence.
+  2. Iterate 2D-LCEM: discard 1000 iterates, keep 2L (+1 for the IVs).
+  3. Confusion: split each 16-bit sample into high/low bytes, permute each
+     byte plane with its own chaotic permutation, then cross-swap high and
+     low bytes at chaotically chosen positions.
+  4. Diffusion: forward pass  c_i = ((v_i + K1_i) mod 2^16) XOR c_{i-1}
+                backward pass e_i = ((c_i + K2_i) mod 2^16) XOR e_{i+1}
+  5. Write the result as a 16-bit WAV of the same length.
+
+Decryption runs the steps in reverse and is lossless. The SHA-256 digest
+travels with the ciphertext (saved next to it as <file>.hash) and doubles
+as an integrity check after decryption.
+
+Usage
+  python lcem_audio_cipher.py encrypt input.wav encrypted.wav
+  python lcem_audio_cipher.py decrypt encrypted.wav decrypted.wav
+  (optional: --x0 --y0 --a --b to set the key)
+
+Requires: numpy, scipy
+"""
+import argparse
+import hashlib
+import math
+import sys
+
+import numpy as np
+from scipy.io import wavfile
+
+K_EXP = 10            # scaling exponent k of 2D-LCEM
+DISCARD = 1000        # transient iterations
+SCALE = 1e14          # used to extract integers from chaotic values
+DEFAULT_KEY = (0.31415926535897, 0.27182818284590, 2.71828182845904, 3.14159265358979)
+
+
+# ---------------------------------------------------------------------------
+# 2D-LCEM map
+# ---------------------------------------------------------------------------
+def lcem_orbit(x0, y0, a, b, n, discard=DISCARD, k=K_EXP):
+    """Return n points (x, y) of the 2D-LCEM orbit after `discard` transients."""
+    A = 2.0 ** k * (a + 1.0)
+    B = 2.0 ** k * (b + 1.0)
+    cos, sin, exp, pi = math.cos, math.sin, math.exp, math.pi
+    x, y = x0, y0
+    for _ in range(discard):
+        x = (A * x * (1.0 - x) + exp(cos(pi * y))) % 1.0
+        y = (B * y * (1.0 - y) + exp(sin(pi * x))) % 1.0
+    xs = np.empty(n)
+    ys = np.empty(n)
+    for i in range(n):
+        x = (A * x * (1.0 - x) + exp(cos(pi * y))) % 1.0
+        y = (B * y * (1.0 - y) + exp(sin(pi * x))) % 1.0
+        xs[i] = x
+        ys[i] = y
+    return xs, ys
+
+
+def to_int(v, modulus):
+    """floor(v * 10^14) mod modulus, element-wise."""
+    return (np.floor(v * SCALE).astype(np.int64) % modulus)
+
+
+# ---------------------------------------------------------------------------
+# Key schedule
+# ---------------------------------------------------------------------------
+def check_key(key):
+    x0, y0, a, b = key
+    if not (0.0 <= x0 < 1.0 and 0.0 <= y0 < 1.0):
+        raise ValueError("x0 and y0 must lie in [0, 1)")
+    if a < 0 or b < 0:
+        raise ValueError("a and b must be non-negative")
+
+
+def audio_digest(samples):
+    """SHA-256 of the samples as little-endian int16 bytes."""
+    return hashlib.sha256(samples.astype("<i2").tobytes()).digest()
+
+
+def chaotic_material(key, digest, L):
+    """Generate every pseudo-random quantity the cipher needs for L samples."""
+    x0, y0, a, b = key
+    d1 = int.from_bytes(digest[:16], "big") / 2.0 ** 128
+    d2 = int.from_bytes(digest[16:], "big") / 2.0 ** 128
+    x0p = (x0 + d1) % 1.0
+    y0p = (y0 + d2) % 1.0
+
+    xs, ys = lcem_orbit(x0p, y0p, a, b, 2 * L + 1)
+    X, Y = xs[:L], ys[:L]                       # confusion block
+    KX, KY = xs[L:2 * L], ys[L:2 * L]           # diffusion block
+
+    return {
+        "P1": np.argsort(X, kind="stable"),       # high-byte permutation
+        "P2": np.argsort(Y, kind="stable"),       # low-byte permutation
+        "swap": ((to_int(X, 2**62) + to_int(Y, 2**62)) % 2).astype(bool),
+        "K1": to_int(KX, 65536),
+        "K2": to_int(KY, 65536),
+        "IV1": int(to_int(np.array([xs[2 * L]]), 65536)[0]),
+        "IV2": int(to_int(np.array([ys[2 * L]]), 65536)[0]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Core cipher on a 1-D int16 array
+# ---------------------------------------------------------------------------
+def encrypt_samples(samples, key=DEFAULT_KEY):
+    """Encrypt a 1-D int16 array. Returns (cipher int16 array, sha256 digest)."""
+    check_key(key)
+    samples = np.asarray(samples, dtype=np.int16)
+    L = samples.size
+    digest = audio_digest(samples)
+    m = chaotic_material(key, digest, L)
+
+    u = samples.astype(np.int64) + 32768           # 0 .. 65535
+    H, Lo = u >> 8, u & 0xFF
+
+    # confusion: separate permutations, then cross-swap at chosen positions
+    H, Lo = H[m["P1"]], Lo[m["P2"]]
+    s = m["swap"]
+    H[s], Lo[s] = Lo[s].copy(), H[s].copy()
+    v = (H << 8) | Lo
+
+    # diffusion: forward then backward, mixing mod-2^16 addition with XOR
+    K1, K2 = m["K1"], m["K2"]
+    c = np.empty(L, dtype=np.int64)
+    prev = m["IV1"]
+    for i in range(L):
+        prev = ((v[i] + K1[i]) & 0xFFFF) ^ prev
+        c[i] = prev
+    e = np.empty(L, dtype=np.int64)
+    nxt = m["IV2"]
+    for i in range(L - 1, -1, -1):
+        nxt = ((c[i] + K2[i]) & 0xFFFF) ^ nxt
+        e[i] = nxt
+
+    return (e - 32768).astype(np.int16), digest
+
+
+def decrypt_samples(cipher, digest, key=DEFAULT_KEY):
+    """Decrypt a 1-D int16 array produced by encrypt_samples."""
+    check_key(key)
+    cipher = np.asarray(cipher, dtype=np.int16)
+    L = cipher.size
+    m = chaotic_material(key, digest, L)
+    K1, K2 = m["K1"], m["K2"]
+
+    e = cipher.astype(np.int64) + 32768
+    e_next = np.empty(L, dtype=np.int64)
+    e_next[:-1] = e[1:]
+    e_next[-1] = m["IV2"]
+    c = ((e ^ e_next) - K2) & 0xFFFF                 # undo backward pass
+
+    c_prev = np.empty(L, dtype=np.int64)
+    c_prev[1:] = c[:-1]
+    c_prev[0] = m["IV1"]
+    v = ((c ^ c_prev) - K1) & 0xFFFF                 # undo forward pass
+
+    H, Lo = v >> 8, v & 0xFF
+    s = m["swap"]
+    H[s], Lo[s] = Lo[s].copy(), H[s].copy()          # undo cross-swap
+    H0 = np.empty(L, dtype=np.int64)
+    L0 = np.empty(L, dtype=np.int64)
+    H0[m["P1"]] = H                                  # undo permutations
+    L0[m["P2"]] = Lo
+    plain = ((H0 << 8) | L0) - 32768
+    return plain.astype(np.int16)
+
+
+# ---------------------------------------------------------------------------
+# WAV helpers (mono or multichannel, 16-bit PCM)
+# ---------------------------------------------------------------------------
+def read_wav(path):
+    rate, data = wavfile.read(path)
+    if data.dtype != np.int16:
+        raise ValueError(f"{path}: only 16-bit PCM WAV is supported (got {data.dtype})")
+    return rate, data
+
+
+def encrypt_wav(in_path, out_path, key=DEFAULT_KEY):
+    rate, data = read_wav(in_path)
+    cipher, digest = encrypt_samples(data.reshape(-1), key)   # channels interleaved
+    wavfile.write(out_path, rate, cipher.reshape(data.shape))
+    with open(out_path + ".hash", "w") as f:
+        f.write(digest.hex())
+    return digest
+
+
+def decrypt_wav(in_path, out_path, key=DEFAULT_KEY, digest=None):
+    rate, data = read_wav(in_path)
+    if digest is None:
+        with open(in_path + ".hash") as f:
+            digest = bytes.fromhex(f.read().strip())
+    plain = decrypt_samples(data.reshape(-1), digest, key)
+    wavfile.write(out_path, rate, plain.reshape(data.shape))
+    ok = audio_digest(plain) == digest
+    return ok
+
+
+# ---------------------------------------------------------------------------
+def main(argv=None):
+    p = argparse.ArgumentParser(description="2D-LCEM audio encryption (16-bit WAV)")
+    p.add_argument("mode", choices=["encrypt", "decrypt"])
+    p.add_argument("input")
+    p.add_argument("output")
+    p.add_argument("--x0", type=float, default=DEFAULT_KEY[0])
+    p.add_argument("--y0", type=float, default=DEFAULT_KEY[1])
+    p.add_argument("--a", type=float, default=DEFAULT_KEY[2])
+    p.add_argument("--b", type=float, default=DEFAULT_KEY[3])
+    args = p.parse_args(argv)
+    key = (args.x0, args.y0, args.a, args.b)
+
+    if args.mode == "encrypt":
+        d = encrypt_wav(args.input, args.output, key)
+        print(f"Encrypted -> {args.output}\nDigest saved -> {args.output}.hash ({d.hex()[:16]}...)")
+    else:
+        ok = decrypt_wav(args.input, args.output, key)
+        print(f"Decrypted -> {args.output}")
+        print("Integrity check:", "PASSED" if ok else "FAILED (wrong key or tampered file)")
+        if not ok:
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+==============================================================================
+FILE: lcem_audio_encryption_analysis.py
+==============================================================================
+import os
+import math
+import hashlib
+import time
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.io import wavfile
+from scipy.signal import spectrogram
+
+# ============================================================
+# 1. CONFIGURATION
+# bird, alarm, female, and male speech
+# ============================================================
+
+AUDIO_PATH = r"C:\Users\sadda\Downloads\male speech.mp3.wav"
+
+# Secret key K = (x0, y0, a, b):  x0, y0 in [0, 1),  a, b >= 0
+KEY = (0.31415926535897, 0.27182818284590, 2.71828182845904, 3.14159265358979)
+
+K_EXP = 10            # scaling exponent k of the 2D-LCEM map (fixed)
+DISCARD = 1000        # transient iterations discarded
+SCALE = 1e14          # extracts integers from chaotic values
+
+MOD = 65536
+MASK = 65535
+
+# Set True to also save every figure as a 300-dpi PNG next to the audio file
+SAVE_FIGURES = False
+FIG_DIR = os.path.join(os.path.dirname(AUDIO_PATH), "lcem_figures")
+
+
+# ============================================================
+# 2. READ AUDIO FILE
+# ============================================================
+
+def load_as_int16(path):
+    """Read a WAV file as int16. Converts 8/24/32-bit and float WAV.
+    Falls back to librosa if the file is not a plain WAV (e.g. a renamed MP3)."""
+    try:
+        rate, data = wavfile.read(path)
+    except Exception:
+        import librosa                                   # pip install librosa
+        y, rate = librosa.load(path, sr=None, mono=False)
+        data = y.T if y.ndim == 2 else y
+        print("Note: file is not a plain WAV; decoded with librosa.")
+
+    if data.dtype == np.int16:
+        return rate, data
+    if data.dtype == np.uint8:
+        out = (data.astype(np.int16) - 128) << 8
+    elif data.dtype == np.int32:
+        out = (data >> 16).astype(np.int16)
+    else:
+        out = np.int16(np.clip(data, -1.0, 1.0) * 32767)
+    print(f"Note: converted {data.dtype} samples to 16-bit PCM.")
+    return rate, out
+
+
+sample_rate, audio = load_as_int16(AUDIO_PATH)
+
+original_shape = audio.shape
+channels = audio.shape[1] if audio.ndim > 1 else 1
+
+# Interleave channels into one sequence; signed int16 samples
+plain = np.ascontiguousarray(audio).reshape(-1).astype(np.int16)
+
+n = len(plain)
+
+if n < 10:
+    raise ValueError("At least 10 audio samples required.")
+
+
+# ============================================================
+# 3. THE 2D-LCEM HYPERCHAOTIC MAP
+# ============================================================
+#   x_{n+1} = [ 2^k (a+1) x_n (1 - x_n) + exp(cos(pi y_n))     ] mod 1
+#   y_{n+1} = [ 2^k (b+1) y_n (1 - y_n) + exp(sin(pi x_{n+1})) ] mod 1
+
+def lcem_orbit(x0, y0, a, b, count, discard=DISCARD, k=K_EXP):
+
+    A = 2.0 ** k * (a + 1.0)
+    B = 2.0 ** k * (b + 1.0)
+
+    cos, sin, exp, pi = math.cos, math.sin, math.exp, math.pi
+
+    x, y = x0, y0
+
+    for _ in range(discard):
+        x = (A * x * (1.0 - x) + exp(cos(pi * y))) % 1.0
+        y = (B * y * (1.0 - y) + exp(sin(pi * x))) % 1.0
+
+    xs = np.empty(count)
+    ys = np.empty(count)
+
+    for i in range(count):
+        x = (A * x * (1.0 - x) + exp(cos(pi * y))) % 1.0
+        y = (B * y * (1.0 - y) + exp(sin(pi * x))) % 1.0
+        xs[i] = x
+        ys[i] = y
+
+    return xs, ys
+
+
+def to_int(v, modulus):
+    return np.floor(v * SCALE).astype(np.int64) % modulus
+
+
+# ============================================================
+# 4. KEY SCHEDULE (PLAINTEXT-DEPENDENT)
+# ============================================================
+
+def audio_digest(samples):
+    return hashlib.sha256(samples.astype("<i2").tobytes()).digest()
+
+
+def chaotic_material(key, digest, size):
+
+    x0, y0, a, b = key
+
+    # SHA-256 of the audio perturbs the initial values
+    d1 = int.from_bytes(digest[:16], "big") / 2.0 ** 128
+    d2 = int.from_bytes(digest[16:], "big") / 2.0 ** 128
+
+    x0p = (x0 + d1) % 1.0
+    y0p = (y0 + d2) % 1.0
+
+    xs, ys = lcem_orbit(x0p, y0p, a, b, 2 * size + 1)
+
+    X, Y = xs[:size], ys[:size]                  # confusion block
+    KX, KY = xs[size:2 * size], ys[size:2 * size]  # diffusion block
+
+    return {
+        "X": X,
+        "Y": Y,
+        "P1": np.argsort(X, kind="stable"),
+        "P2": np.argsort(Y, kind="stable"),
+        "swap": ((to_int(X, 2**62) + to_int(Y, 2**62)) % 2).astype(bool),
+        "K1": to_int(KX, MOD),
+        "K2": to_int(KY, MOD),
+        "IV1": int(to_int(np.array([xs[2 * size]]), MOD)[0]),
+        "IV2": int(to_int(np.array([ys[2 * size]]), MOD)[0]),
+    }
+
+
+# ============================================================
+# 5. CONFUSION: BIT-PLANE CROSS SCRAMBLING
+# ============================================================
+
+def confusion(u, m):
+    """u: unsigned samples (0..65535). Permute high and low bytes with
+    separate permutations, then cross-swap them at chaotic positions."""
+
+    H, L = u >> 8, u & 0xFF
+
+    H, L = H[m["P1"]], L[m["P2"]]
+
+    s = m["swap"]
+    H[s], L[s] = L[s].copy(), H[s].copy()
+
+    return (H << 8) | L
+
+
+def inverse_confusion(v, m):
+
+    H, L = v >> 8, v & 0xFF
+
+    s = m["swap"]
+    H[s], L[s] = L[s].copy(), H[s].copy()
+
+    H0 = np.empty_like(H)
+    L0 = np.empty_like(L)
+    H0[m["P1"]] = H
+    L0[m["P2"]] = L
+
+    return (H0 << 8) | L0
+
+
+# ============================================================
+# 6. DIFFUSION: BIDIRECTIONAL ADD-XOR CHAINING
+# ============================================================
+#   forward : c_i = ((v_i + K1_i) mod 2^16) XOR c_{i-1}
+#   backward: e_i = ((c_i + K2_i) mod 2^16) XOR e_{i+1}
+
+def diffuse(v, m):
+
+    K1, K2 = m["K1"], m["K2"]
+    size = len(v)
+
+    c = np.empty(size, dtype=np.int64)
+    prev = m["IV1"]
+    for i in range(size):
+        prev = ((int(v[i]) + int(K1[i])) & MASK) ^ prev
+        c[i] = prev
+
+    e = np.empty(size, dtype=np.int64)
+    nxt = m["IV2"]
+    for i in range(size - 1, -1, -1):
+        nxt = ((int(c[i]) + int(K2[i])) & MASK) ^ nxt
+        e[i] = nxt
+
+    return e
+
+
+def inverse_diffusion(e, m):
+
+    K1, K2 = m["K1"], m["K2"]
+
+    e_next = np.empty_like(e)
+    e_next[:-1] = e[1:]
+    e_next[-1] = m["IV2"]
+    c = ((e ^ e_next) - K2) & MASK
+
+    c_prev = np.empty_like(c)
+    c_prev[1:] = c[:-1]
+    c_prev[0] = m["IV1"]
+
+    return ((c ^ c_prev) - K1) & MASK
+
+
+# ============================================================
+# 7. ENCRYPTION AND DECRYPTION
+# ============================================================
+
+def encrypt(samples, key):
+
+    digest = audio_digest(samples)
+    m = chaotic_material(key, digest, len(samples))
+
+    u = samples.astype(np.int64) + 32768
+    e = diffuse(confusion(u, m), m)
+
+    return (e - 32768).astype(np.int16), digest, m
+
+
+def decrypt(cipher, digest, key):
+
+    m = chaotic_material(key, digest, len(cipher))
+
+    e = cipher.astype(np.int64) + 32768
+    u = inverse_confusion(inverse_diffusion(e, m), m)
+
+    return (u - 32768).astype(np.int16)
+
+
+start = time.perf_counter()
+encrypted, DIGEST, material = encrypt(plain, KEY)
+encryption_time = time.perf_counter() - start
+
+start = time.perf_counter()
+decrypted = decrypt(encrypted, DIGEST, KEY)
+decryption_time = time.perf_counter() - start
+
+exact_recovery = np.array_equal(plain, decrypted)
+integrity_ok = audio_digest(decrypted) == DIGEST
+
+assert exact_recovery, "Decryption failed!"
+
+
+# ============================================================
+# 8. CORRELATION ANALYSIS
+# ============================================================
+
+def correlation(values):
+    x = values.astype(np.float64)
+    return np.corrcoef(x[:-1], x[1:])[0, 1]
+
+
+original_corr = correlation(plain)
+encrypted_corr = correlation(encrypted)
+decrypted_corr = correlation(decrypted)
+
+
+# ============================================================
+# 9. SHANNON ENTROPY
+# ============================================================
+
+def entropy(values):
+    counts = np.bincount(values.astype(np.int64) + 32768, minlength=MOD)
+    p = counts[counts > 0] / len(values)
+    return -np.sum(p * np.log2(p))
+
+
+def ideal_entropy(size, bins=MOD):
+    """Expected entropy of truly uniform data with this many samples
+    (finite-sample limit; 16 bits is reached only as size -> infinity)."""
+    rng = np.random.default_rng(0)
+    return entropy(rng.integers(-32768, 32768, size).astype(np.int16))
+
+
+original_entropy = entropy(plain)
+encrypted_entropy = entropy(encrypted)
+decrypted_entropy = entropy(decrypted)
+reference_entropy = ideal_entropy(n)
+
+
+# ============================================================
+# 10. NSCR / NPCR AND UACI (ONE-BIT PLAINTEXT CHANGE)
+# ============================================================
+
+def npcr(a, b):
+    return 100.0 * np.mean(a != b)
+
+
+def uaci(a, b):
+    d = np.abs(a.astype(np.float64) - b.astype(np.float64))
+    return 100.0 * np.mean(d / MASK)
+
+
+modified_plain = plain.copy()
+modified_plain[n // 2] ^= np.int16(1)          # flip the least significant bit
+
+modified_encrypted, _, _ = encrypt(modified_plain, KEY)
+
+npcr_value = npcr(encrypted, modified_encrypted)
+uaci_value = uaci(encrypted, modified_encrypted)
+
+
+# ============================================================
+# 11. HISTOGRAM CHI-SQUARE ANALYSIS
+# ============================================================
+
+def histogram_chi_square(values):
+    counts = np.bincount(values.astype(np.int64) + 32768, minlength=MOD)
+    expected = len(values) / MOD
+    return np.sum((counts - expected) ** 2 / expected)
+
+
+original_chi = histogram_chi_square(plain)
+encrypted_chi = histogram_chi_square(encrypted)
+decrypted_chi = histogram_chi_square(decrypted)
+
+# Critical value of chi-square with 65535 degrees of freedom at 5%
+# (Wilson-Hilferty approximation)
+dof = MOD - 1
+chi_critical = dof * (1 - 2 / (9 * dof) + 1.6449 * math.sqrt(2 / (9 * dof))) ** 3
+
+
+# ============================================================
+# 12. FINAL OUTPUT
+# ============================================================
+
+print("\n" + "=" * 55)
+print("     2D-LCEM CHAOTIC AUDIO ENCRYPTION")
+print("=" * 55)
+
+print("\n========== AUDIO INFORMATION ==========")
+print(f"Sampling Rate       : {sample_rate}")
+print(f"Channels            : {channels}")
+print(f"Total Samples       : {n}")
+print(f"Duration            : {len(audio)/sample_rate:.4f} s")
+
+print("\n========== KEY ==========")
+print(f"x0, y0              : {KEY[0]}, {KEY[1]}")
+print(f"a, b                : {KEY[2]}, {KEY[3]}")
+print(f"k (fixed)           : {K_EXP}")
+print(f"SHA-256 of audio    : {DIGEST.hex()[:32]}...")
+print(f"Cross-swapped bytes : {100*np.mean(material['swap']):.2f}% of positions")
+
+print("\n========== ENCRYPTION ==========")
+print(f"Encryption Time     : {encryption_time:.6f} s")
+print(f"Decryption Time     : {decryption_time:.6f} s")
+print(f"Throughput          : {2*n/1e6/encryption_time:.3f} MB/s")
+print(f"Exact Recovery      : {exact_recovery}")
+print(f"Integrity Check     : {integrity_ok}")
+
+print("\n========== CORRELATION ==========")
+print(f"Original            : {original_corr:.6f}")
+print(f"Encrypted           : {encrypted_corr:.6f}")
+print(f"Decrypted           : {decrypted_corr:.6f}")
+
+print("\n========== ENTROPY ==========")
+print(f"Original            : {original_entropy:.6f}")
+print(f"Encrypted           : {encrypted_entropy:.6f}")
+print(f"Decrypted           : {decrypted_entropy:.6f}")
+print(f"Ideal for N={n:<8d}: {reference_entropy:.6f}  (16 only as N -> infinity)")
+
+print("\n========== DIFFERENTIAL ANALYSIS ==========")
+print(f"NPCR (NSCR)         : {npcr_value:.6f}%   (ideal about 99.9985%)")
+print(f"UACI                : {uaci_value:.6f}%   (ideal about 33.334%)")
+
+print("\n========== HISTOGRAM ANALYSIS ==========")
+print(f"Original Chi-Square : {original_chi:.2f}")
+print(f"Encrypted Chi-Square: {encrypted_chi:.2f}")
+print(f"Decrypted Chi-Square: {decrypted_chi:.2f}")
+print(f"Critical value (5%) : {chi_critical:.2f}")
+print(f"Encrypted uniform?  : {encrypted_chi < chi_critical}")
+print("=" * 55)
+
+
+# ============================================================
+# helper: show and optionally save each figure
+# ============================================================
+
+def finish(fig, name):
+    fig.tight_layout()
+    if SAVE_FIGURES:
+        os.makedirs(FIG_DIR, exist_ok=True)
+        fig.savefig(os.path.join(FIG_DIR, name + ".png"), dpi=300)
+    plt.show()
+
+
+original_signed = plain
+encrypted_signed = encrypted
+decrypted_signed = decrypted
+
+signals = [original_signed, encrypted_signed, decrypted_signed]
+titles = ["Original Audio", "Encrypted Audio", "Decrypted Audio"]
+time_axis = np.arange(n) / (sample_rate * channels)
+
+
+# ============================================================
+# 13. WAVEFORM VISUALIZATION
+# ============================================================
+
+fig, axes = plt.subplots(3, 1, figsize=(11, 8))
+
+for ax, signal, title in zip(axes, signals, titles):
+    ax.plot(time_axis, signal / 32768.0, linewidth=0.4)
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.set_ylabel("Amplitude")
+    ax.set_xlim(0, time_axis[-1])
+    ax.set_ylim(-1, 1)
+    ax.grid(alpha=0.25)
+
+axes[-1].set_xlabel("Time (s)")
+finish(fig, "fig_waveforms")
+
+
+# ============================================================
+# 14. SPECTROGRAMS
+# ============================================================
+
+mono_rate = sample_rate
+fig, axes = plt.subplots(3, 1, figsize=(11, 9))
+
+for ax, signal, title in zip(axes, signals, titles):
+    s = signal.reshape(-1, channels)[:, 0].astype(np.float64)   # first channel
+    f, t, S = spectrogram(s, fs=mono_rate, nperseg=1024, noverlap=512)
+    im = ax.pcolormesh(t, f / 1000, 10 * np.log10(S + 1e-10),
+                       shading="auto", cmap="magma")
+    ax.set_title(title + " Spectrogram", fontsize=10, fontweight="bold")
+    ax.set_ylabel("Frequency (kHz)")
+    fig.colorbar(im, ax=ax, label="Power (dB)")
+
+axes[-1].set_xlabel("Time (s)")
+finish(fig, "fig_spectrograms")
+
+
+# ============================================================
+# 15. HISTOGRAM VISUALIZATION
+# ============================================================
+
+fig, axes = plt.subplots(3, 1, figsize=(11, 9))
+
+for ax, signal, title in zip(axes, signals, titles):
+    ax.hist(signal, bins=256, range=(-32768, 32768))
+    ax.set_title(title + " Histogram", fontsize=10, fontweight="bold")
+    ax.set_xlabel("Sample Value")
+    ax.set_ylabel("Frequency")
+    ax.set_xlim(-32768, 32767)
+    ax.grid(alpha=0.25)
+
+finish(fig, "fig_histograms")
+
+
+# ============================================================
+# 16. SCATTER PLOTS
+# ============================================================
+
+scatter_rng = np.random.default_rng(12345)
+
+num_points = min(n - 1, 10000)
+pick = np.sort(scatter_rng.choice(n - 1, size=num_points, replace=False))
+
+orig_norm = original_signed.astype(np.float64) / 32768.0
+enc_norm = encrypted_signed.astype(np.float64) / 32768.0
+
+# ---- Figure A: adjacent-sample scatter ----
+fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+
+for ax, values, title, corr in zip(
+    axes, (orig_norm, enc_norm),
+    ("Original Audio", "Encrypted Audio"),
+    (original_corr, encrypted_corr)
+):
+    ax.scatter(values[pick], values[pick + 1], s=2, alpha=0.35)
+    ax.set_title(f"{title}\nCorrelation = {corr:.6f}")
+    ax.set_xlabel("Normalized sample value x[i]")
+    ax.set_ylabel("Normalized sample value x[i+1]")
+    ax.set_xlim(-1, 1)
+    ax.set_ylim(-1, 1)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(alpha=0.25)
+
+finish(fig, "fig_adjacent_scatter")
+
+# ---- Figure B: original vs encrypted ----
+pick_b = np.sort(scatter_rng.choice(n, size=min(n, 10000), replace=False))
+plain_vs_cipher_corr = np.corrcoef(orig_norm, enc_norm)[0, 1]
+
+fig, ax = plt.subplots(figsize=(7, 7))
+ax.scatter(orig_norm[pick_b], enc_norm[pick_b], s=2, alpha=0.35)
+ax.set_title(f"Original vs Encrypted Samples\nCorrelation = {plain_vs_cipher_corr:.6f}")
+ax.set_xlabel("Original sample value (normalized)")
+ax.set_ylabel("Encrypted sample value (normalized)")
+ax.set_xlim(-1, 1)
+ax.set_ylim(-1, 1)
+ax.set_aspect("equal", adjustable="box")
+ax.grid(alpha=0.25)
+finish(fig, "fig_plain_vs_cipher")
+
+print("\n========== SCATTER ANALYSIS ==========")
+print(f"Points plotted                     : {num_points}")
+print(f"Adjacent corr. (original)          : {original_corr:.6f}")
+print(f"Adjacent corr. (encrypted)         : {encrypted_corr:.6f}")
+print(f"Original vs encrypted correlation  : {plain_vs_cipher_corr:.6f}")
+
+
+# ============================================================
+# 17. CHAOTIC SEQUENCE VISUALIZATION
+# ============================================================
+
+display_n = min(n, 3000)
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+axes[0, 0].plot(material["X"][:display_n], linewidth=0.5)
+axes[0, 0].set_title("Chaotic sequence x (first samples)")
+axes[0, 0].set_xlabel("Iteration")
+axes[0, 0].set_ylabel("x")
+
+axes[0, 1].scatter(material["X"][:20000], material["Y"][:20000], s=0.5, alpha=0.4)
+axes[0, 1].set_title("Phase portrait of the key sequence")
+axes[0, 1].set_xlabel("x")
+axes[0, 1].set_ylabel("y")
+axes[0, 1].set_xlim(0, 1)
+axes[0, 1].set_ylim(0, 1)
+
+axes[1, 0].plot(material["K1"][:display_n], linewidth=0.5)
+axes[1, 0].set_title("Diffusion keystream K1 (16-bit)")
+axes[1, 0].set_xlabel("Index")
+axes[1, 0].set_ylabel("Value")
+
+axes[1, 1].scatter(np.arange(display_n), material["P1"][:display_n], s=1)
+axes[1, 1].set_title("High-byte permutation P1")
+axes[1, 1].set_xlabel("Output position")
+axes[1, 1].set_ylabel("Source position")
+
+for ax in axes.ravel():
+    ax.grid(alpha=0.25)
+
+finish(fig, "fig_chaotic_sequences")
+
+
+# ============================================================
+# 18. KEY SENSITIVITY ANALYSIS
+# ============================================================
+# Each trial changes ONE key component by a tiny amount and
+# encrypts the same plaintext again.
+
+DELTA = {"x0": 1e-15, "y0": 1e-15, "a": 1e-14, "b": 1e-14}
+
+
+def perturbed_key(name):
+    k = list(KEY)
+    idx = ["x0", "y0", "a", "b"].index(name)
+    k[idx] += DELTA[name]
+    return tuple(k)
+
+
+def bit_difference(a, b):
+    xor_bytes = (a.view(np.uint16) ^ b.view(np.uint16)).view(np.uint8)
+    return 100.0 * np.unpackbits(xor_bytes).mean()
+
+
+ks_npcr, ks_uaci, ks_bits = [], [], []
+first_modified_cipher = None
+
+print("\n========== KEY SENSITIVITY ==========")
+
+for name in ["x0", "y0", "a", "b"]:
+
+    k2 = perturbed_key(name)
+    modified_cipher, _, _ = encrypt(plain, k2)
+
+    if first_modified_cipher is None:
+        first_modified_cipher = modified_cipher
+
+    ks_npcr.append(npcr(encrypted, modified_cipher))
+    ks_uaci.append(uaci(encrypted, modified_cipher))
+    ks_bits.append(bit_difference(encrypted, modified_cipher))
+
+    print(f"  {name} + {DELTA[name]:.0e} | NPCR = {ks_npcr[-1]:.6f}% | "
+          f"UACI = {ks_uaci[-1]:.6f}% | Bit difference = {ks_bits[-1]:.4f}%")
+
+print("\n---------- Key sensitivity summary (mean +/- std) ----------")
+print(f"NPCR           : {np.mean(ks_npcr):.6f}% +/- {np.std(ks_npcr):.6f}   (ideal about 99.9985%)")
+print(f"UACI           : {np.mean(ks_uaci):.6f}% +/- {np.std(ks_uaci):.6f}   (ideal about 33.334%)")
+print(f"Bit difference : {np.mean(ks_bits):.4f}% +/- {np.std(ks_bits):.4f}   (ideal about 50%)")
+
+
+# ---------- 18.1 Decryption with a slightly wrong key ----------
+
+wrong_key = perturbed_key("x0")
+wrong_decrypted = decrypt(encrypted, DIGEST, wrong_key)
+
+assert not np.array_equal(plain, wrong_decrypted)
+
+wrong_match = 100.0 * np.mean(plain == wrong_decrypted)
+wrong_bit_diff = bit_difference(plain, wrong_decrypted)
+wrong_adj_corr = correlation(wrong_decrypted)
+plain_vs_wrong_corr = np.corrcoef(plain.astype(float), wrong_decrypted.astype(float))[0, 1]
+
+print("\n---------- Decryption with x0 + 1e-15 ----------")
+print(f"Samples matching original          : {wrong_match:.6f}%")
+print(f"Bit difference from original       : {wrong_bit_diff:.4f}%")
+print(f"Adjacent correlation (wrong key)   : {wrong_adj_corr:.6f}")
+print(f"Original vs wrong-key correlation  : {plain_vs_wrong_corr:.6f}")
+
+
+# ---------- 18.2 Key sensitivity waveforms ----------
+
+original_wave = original_signed / 32768.0
+correct_wave = decrypted_signed / 32768.0
+wrong_wave = wrong_decrypted / 32768.0
+
+wave_panels = [
+    (original_wave, "(a) Original Audio", "blue"),
+    (correct_wave, "(b) Correct Key Decryption", "green"),
+    (wrong_wave, "(c) Wrong Key Decryption (x0 + 1e-15)", "red"),
+]
+
+tight_limit = max(1.1 * np.max(np.abs(original_wave)), 1e-3)
+
+fig, axes = plt.subplots(3, 1, figsize=(11, 8.5))
+
+for k, (ax, (wave, title, color)) in enumerate(zip(axes, wave_panels)):
+    ax.plot(time_axis, wave, color=color, linewidth=0.5)
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.set_xlim(0, time_axis[-1])
+    ax.set_ylim(-1, 1) if k == 2 else ax.set_ylim(-tight_limit, tight_limit)
+
+axes[-1].set_xlabel("Time (s)", fontsize=10, fontweight="bold")
+finish(fig, "fig_key_sensitivity_waveforms")
+
+
+# ---------- 18.3 Key sensitivity scatter plots ----------
+
+cipher_1 = encrypted_signed / 32768.0
+cipher_2 = first_modified_cipher / 32768.0
+wrong_norm = wrong_decrypted / 32768.0
+cipher_vs_cipher_corr = np.corrcoef(cipher_1, cipher_2)[0, 1]
+
+key_rng = np.random.default_rng(2026)
+pick_k = np.sort(key_rng.choice(n, size=min(n, 10000), replace=False))
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+
+axes[0].scatter(cipher_1[pick_k], cipher_2[pick_k], s=2, alpha=0.35)
+axes[0].set_title("Ciphertext: Correct Key vs x0 + 1e-15\n"
+                  f"Correlation = {cipher_vs_cipher_corr:.6f}")
+axes[0].set_xlabel("Encrypted sample (correct key)")
+axes[0].set_ylabel("Encrypted sample (changed key)")
+
+axes[1].scatter(wrong_norm[pick], wrong_norm[pick + 1], s=2, alpha=0.35)
+axes[1].set_title(f"Wrong-Key Decrypted Audio\nCorrelation = {wrong_adj_corr:.6f}")
+axes[1].set_xlabel("Normalized sample value x[i]")
+axes[1].set_ylabel("Normalized sample value x[i+1]")
+
+for ax in axes:
+    ax.set_xlim(-1, 1)
+    ax.set_ylim(-1, 1)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(alpha=0.25)
+
+finish(fig, "fig_key_sensitivity_scatter")
+
+
+# ============================================================
+# 19. KEY SPACE
+# ============================================================
+
+key_space_log10 = 15 + 15 + 17 + 17     # x0, y0 (1e-15 steps); a, b in [0,100] (1e-15 steps)
+print("\n========== KEY SPACE ==========")
+print(f"Key space           : about 10^{key_space_log10} = 2^{key_space_log10*math.log2(10):.0f}")
+
+recovered_audio = decrypted.reshape(original_shape)
+
+# No WAV files are saved. Set SAVE_FIGURES = True to save the figures.
+# ---------------------------------------------------------------------------
+# The complete encryption and decryption python code  
+# ---------------------------------------------------------------------------
+
+
+import os
+import math
+import hashlib
+import time
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.io import wavfile
+from scipy.signal import spectrogram
+
+# ============================================================
+# 1. CONFIGURATION
+# bird, alarm, female, and male speech
+# ============================================================
+
+AUDIO_PATH = r"C:\Users\sadda\Downloads\male speech.mp3.wav"
+
+# Secret key K = (x0, y0, a, b):  x0, y0 in [0, 1),  a, b >= 0
+KEY = (0.31415926535897, 0.27182818284590, 2.71828182845904, 3.14159265358979)
+
+K_EXP = 10            # scaling exponent k of the 2D-LCEM map (fixed)
+DISCARD = 1000        # transient iterations discarded
+SCALE = 1e14          # extracts integers from chaotic values
+
+MOD = 65536
+MASK = 65535
+
+# Set True to also save every figure as a 300-dpi PNG next to the audio file
+SAVE_FIGURES = False
+FIG_DIR = os.path.join(os.path.dirname(AUDIO_PATH), "lcem_figures")
+
+
+# ============================================================
+# 2. READ AUDIO FILE
+# ============================================================
+
+def load_as_int16(path):
+    """Read a WAV file as int16. Converts 8/24/32-bit and float WAV.
+    Falls back to librosa if the file is not a plain WAV (e.g. a renamed MP3)."""
+    try:
+        rate, data = wavfile.read(path)
+    except Exception:
+        import librosa                                   # pip install librosa
+        y, rate = librosa.load(path, sr=None, mono=False)
+        data = y.T if y.ndim == 2 else y
+        print("Note: file is not a plain WAV; decoded with librosa.")
+
+    if data.dtype == np.int16:
+        return rate, data
+    if data.dtype == np.uint8:
+        out = (data.astype(np.int16) - 128) << 8
+    elif data.dtype == np.int32:
+        out = (data >> 16).astype(np.int16)
+    else:
+        out = np.int16(np.clip(data, -1.0, 1.0) * 32767)
+    print(f"Note: converted {data.dtype} samples to 16-bit PCM.")
+    return rate, out
+
+
+sample_rate, audio = load_as_int16(AUDIO_PATH)
+
+original_shape = audio.shape
+channels = audio.shape[1] if audio.ndim > 1 else 1
+
+# Interleave channels into one sequence; signed int16 samples
+plain = np.ascontiguousarray(audio).reshape(-1).astype(np.int16)
+
+n = len(plain)
+
+if n < 10:
+    raise ValueError("At least 10 audio samples required.")
+
+
+# ============================================================
+# 3. THE 2D-LCEM HYPERCHAOTIC MAP
+# ============================================================
+#   x_{n+1} = [ 2^k (a+1) x_n (1 - x_n) + exp(cos(pi y_n))     ] mod 1
+#   y_{n+1} = [ 2^k (b+1) y_n (1 - y_n) + exp(sin(pi x_{n+1})) ] mod 1
+
+def lcem_orbit(x0, y0, a, b, count, discard=DISCARD, k=K_EXP):
+
+    A = 2.0 ** k * (a + 1.0)
+    B = 2.0 ** k * (b + 1.0)
+
+    cos, sin, exp, pi = math.cos, math.sin, math.exp, math.pi
+
+    x, y = x0, y0
+
+    for _ in range(discard):
+        x = (A * x * (1.0 - x) + exp(cos(pi * y))) % 1.0
+        y = (B * y * (1.0 - y) + exp(sin(pi * x))) % 1.0
+
+    xs = np.empty(count)
+    ys = np.empty(count)
+
+    for i in range(count):
+        x = (A * x * (1.0 - x) + exp(cos(pi * y))) % 1.0
+        y = (B * y * (1.0 - y) + exp(sin(pi * x))) % 1.0
+        xs[i] = x
+        ys[i] = y
+
+    return xs, ys
+
+
+def to_int(v, modulus):
+    return np.floor(v * SCALE).astype(np.int64) % modulus
+
+
+# ============================================================
+# 4. KEY SCHEDULE (PLAINTEXT-DEPENDENT)
+# ============================================================
+
+def audio_digest(samples):
+    return hashlib.sha256(samples.astype("<i2").tobytes()).digest()
+
+
+def chaotic_material(key, digest, size):
+
+    x0, y0, a, b = key
+
+    # SHA-256 of the audio perturbs the initial values
+    d1 = int.from_bytes(digest[:16], "big") / 2.0 ** 128
+    d2 = int.from_bytes(digest[16:], "big") / 2.0 ** 128
+
+    x0p = (x0 + d1) % 1.0
+    y0p = (y0 + d2) % 1.0
+
+    xs, ys = lcem_orbit(x0p, y0p, a, b, 2 * size + 1)
+
+    X, Y = xs[:size], ys[:size]                  # confusion block
+    KX, KY = xs[size:2 * size], ys[size:2 * size]  # diffusion block
+
+    return {
+        "X": X,
+        "Y": Y,
+        "P1": np.argsort(X, kind="stable"),
+        "P2": np.argsort(Y, kind="stable"),
+        "swap": ((to_int(X, 2**62) + to_int(Y, 2**62)) % 2).astype(bool),
+        "K1": to_int(KX, MOD),
+        "K2": to_int(KY, MOD),
+        "IV1": int(to_int(np.array([xs[2 * size]]), MOD)[0]),
+        "IV2": int(to_int(np.array([ys[2 * size]]), MOD)[0]),
+    }
+
+
+# ============================================================
+# 5. CONFUSION: BIT-PLANE CROSS SCRAMBLING
+# ============================================================
+
+def confusion(u, m):
+    """u: unsigned samples (0..65535). Permute high and low bytes with
+    separate permutations, then cross-swap them at chaotic positions."""
+
+    H, L = u >> 8, u & 0xFF
+
+    H, L = H[m["P1"]], L[m["P2"]]
+
+    s = m["swap"]
+    H[s], L[s] = L[s].copy(), H[s].copy()
+
+    return (H << 8) | L
+
+
+def inverse_confusion(v, m):
+
+    H, L = v >> 8, v & 0xFF
+
+    s = m["swap"]
+    H[s], L[s] = L[s].copy(), H[s].copy()
+
+    H0 = np.empty_like(H)
+    L0 = np.empty_like(L)
+    H0[m["P1"]] = H
+    L0[m["P2"]] = L
+
+    return (H0 << 8) | L0
+
+
+# ============================================================
+# 6. DIFFUSION: BIDIRECTIONAL ADD-XOR CHAINING
+# ============================================================
+#   forward : c_i = ((v_i + K1_i) mod 2^16) XOR c_{i-1}
+#   backward: e_i = ((c_i + K2_i) mod 2^16) XOR e_{i+1}
+
+def diffuse(v, m):
+
+    K1, K2 = m["K1"], m["K2"]
+    size = len(v)
+
+    c = np.empty(size, dtype=np.int64)
+    prev = m["IV1"]
+    for i in range(size):
+        prev = ((int(v[i]) + int(K1[i])) & MASK) ^ prev
+        c[i] = prev
+
+    e = np.empty(size, dtype=np.int64)
+    nxt = m["IV2"]
+    for i in range(size - 1, -1, -1):
+        nxt = ((int(c[i]) + int(K2[i])) & MASK) ^ nxt
+        e[i] = nxt
+
+    return e
+
+
+def inverse_diffusion(e, m):
+
+    K1, K2 = m["K1"], m["K2"]
+
+    e_next = np.empty_like(e)
+    e_next[:-1] = e[1:]
+    e_next[-1] = m["IV2"]
+    c = ((e ^ e_next) - K2) & MASK
+
+    c_prev = np.empty_like(c)
+    c_prev[1:] = c[:-1]
+    c_prev[0] = m["IV1"]
+
+    return ((c ^ c_prev) - K1) & MASK
+
+
+# ============================================================
+# 7. ENCRYPTION AND DECRYPTION
+# ============================================================
+
+def encrypt(samples, key):
+
+    digest = audio_digest(samples)
+    m = chaotic_material(key, digest, len(samples))
+
+    u = samples.astype(np.int64) + 32768
+    e = diffuse(confusion(u, m), m)
+
+    return (e - 32768).astype(np.int16), digest, m
+
+
+def decrypt(cipher, digest, key):
+
+    m = chaotic_material(key, digest, len(cipher))
+
+    e = cipher.astype(np.int64) + 32768
+    u = inverse_confusion(inverse_diffusion(e, m), m)
+
+    return (u - 32768).astype(np.int16)
+
+
+start = time.perf_counter()
+encrypted, DIGEST, material = encrypt(plain, KEY)
+encryption_time = time.perf_counter() - start
+
+start = time.perf_counter()
+decrypted = decrypt(encrypted, DIGEST, KEY)
+decryption_time = time.perf_counter() - start
+
+exact_recovery = np.array_equal(plain, decrypted)
+integrity_ok = audio_digest(decrypted) == DIGEST
+
+assert exact_recovery, "Decryption failed!"
+
+
+# ============================================================
+# 8. CORRELATION ANALYSIS
+# ============================================================
+
+def correlation(values):
+    x = values.astype(np.float64)
+    return np.corrcoef(x[:-1], x[1:])[0, 1]
+
+
+original_corr = correlation(plain)
+encrypted_corr = correlation(encrypted)
+decrypted_corr = correlation(decrypted)
+
+
+# ============================================================
+# 9. SHANNON ENTROPY
+# ============================================================
+
+def entropy(values):
+    counts = np.bincount(values.astype(np.int64) + 32768, minlength=MOD)
+    p = counts[counts > 0] / len(values)
+    return -np.sum(p * np.log2(p))
+
+
+def ideal_entropy(size, bins=MOD):
+    """Expected entropy of truly uniform data with this many samples
+    (finite-sample limit; 16 bits is reached only as size -> infinity)."""
+    rng = np.random.default_rng(0)
+    return entropy(rng.integers(-32768, 32768, size).astype(np.int16))
+
+
+original_entropy = entropy(plain)
+encrypted_entropy = entropy(encrypted)
+decrypted_entropy = entropy(decrypted)
+reference_entropy = ideal_entropy(n)
+
+
+# ============================================================
+# 10. NSCR / NPCR AND UACI (ONE-BIT PLAINTEXT CHANGE)
+# ============================================================
+
+def npcr(a, b):
+    return 100.0 * np.mean(a != b)
+
+
+def uaci(a, b):
+    d = np.abs(a.astype(np.float64) - b.astype(np.float64))
+    return 100.0 * np.mean(d / MASK)
+
+
+modified_plain = plain.copy()
+modified_plain[n // 2] ^= np.int16(1)          # flip the least significant bit
+
+modified_encrypted, _, _ = encrypt(modified_plain, KEY)
+
+npcr_value = npcr(encrypted, modified_encrypted)
+uaci_value = uaci(encrypted, modified_encrypted)
+
+
+# ============================================================
+# 11. HISTOGRAM CHI-SQUARE ANALYSIS
+# ============================================================
+
+def histogram_chi_square(values):
+    counts = np.bincount(values.astype(np.int64) + 32768, minlength=MOD)
+    expected = len(values) / MOD
+    return np.sum((counts - expected) ** 2 / expected)
+
+
+original_chi = histogram_chi_square(plain)
+encrypted_chi = histogram_chi_square(encrypted)
+decrypted_chi = histogram_chi_square(decrypted)
+
+# Critical value of chi-square with 65535 degrees of freedom at 5%
+# (Wilson-Hilferty approximation)
+dof = MOD - 1
+chi_critical = dof * (1 - 2 / (9 * dof) + 1.6449 * math.sqrt(2 / (9 * dof))) ** 3
+
+
+# ============================================================
+# 12. FINAL OUTPUT
+# ============================================================
+
+print("\n" + "=" * 55)
+print("     2D-LCEM CHAOTIC AUDIO ENCRYPTION")
+print("=" * 55)
+
+print("\n========== AUDIO INFORMATION ==========")
+print(f"Sampling Rate       : {sample_rate}")
+print(f"Channels            : {channels}")
+print(f"Total Samples       : {n}")
+print(f"Duration            : {len(audio)/sample_rate:.4f} s")
+
+print("\n========== KEY ==========")
+print(f"x0, y0              : {KEY[0]}, {KEY[1]}")
+print(f"a, b                : {KEY[2]}, {KEY[3]}")
+print(f"k (fixed)           : {K_EXP}")
+print(f"SHA-256 of audio    : {DIGEST.hex()[:32]}...")
+print(f"Cross-swapped bytes : {100*np.mean(material['swap']):.2f}% of positions")
+
+print("\n========== ENCRYPTION ==========")
+print(f"Encryption Time     : {encryption_time:.6f} s")
+print(f"Decryption Time     : {decryption_time:.6f} s")
+print(f"Throughput          : {2*n/1e6/encryption_time:.3f} MB/s")
+print(f"Exact Recovery      : {exact_recovery}")
+print(f"Integrity Check     : {integrity_ok}")
+
+print("\n========== CORRELATION ==========")
+print(f"Original            : {original_corr:.6f}")
+print(f"Encrypted           : {encrypted_corr:.6f}")
+print(f"Decrypted           : {decrypted_corr:.6f}")
+
+print("\n========== ENTROPY ==========")
+print(f"Original            : {original_entropy:.6f}")
+print(f"Encrypted           : {encrypted_entropy:.6f}")
+print(f"Decrypted           : {decrypted_entropy:.6f}")
+print(f"Ideal for N={n:<8d}: {reference_entropy:.6f}  (16 only as N -> infinity)")
+
+print("\n========== DIFFERENTIAL ANALYSIS ==========")
+print(f"NPCR (NSCR)         : {npcr_value:.6f}%   (ideal about 99.9985%)")
+print(f"UACI                : {uaci_value:.6f}%   (ideal about 33.334%)")
+
+print("\n========== HISTOGRAM ANALYSIS ==========")
+print(f"Original Chi-Square : {original_chi:.2f}")
+print(f"Encrypted Chi-Square: {encrypted_chi:.2f}")
+print(f"Decrypted Chi-Square: {decrypted_chi:.2f}")
+print(f"Critical value (5%) : {chi_critical:.2f}")
+print(f"Encrypted uniform?  : {encrypted_chi < chi_critical}")
+print("=" * 55)
+
+
+# ============================================================
+# helper: show and optionally save each figure
+# ============================================================
+
+def finish(fig, name):
+    fig.tight_layout()
+    if SAVE_FIGURES:
+        os.makedirs(FIG_DIR, exist_ok=True)
+        fig.savefig(os.path.join(FIG_DIR, name + ".png"), dpi=300)
+    plt.show()
+
+
+original_signed = plain
+encrypted_signed = encrypted
+decrypted_signed = decrypted
+
+signals = [original_signed, encrypted_signed, decrypted_signed]
+titles = ["Original Audio", "Encrypted Audio", "Decrypted Audio"]
+time_axis = np.arange(n) / (sample_rate * channels)
+
+
+# ============================================================
+# 13. WAVEFORM VISUALIZATION
+# ============================================================
+
+fig, axes = plt.subplots(3, 1, figsize=(11, 8))
+
+for ax, signal, title in zip(axes, signals, titles):
+    ax.plot(time_axis, signal / 32768.0, linewidth=0.4)
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.set_ylabel("Amplitude")
+    ax.set_xlim(0, time_axis[-1])
+    ax.set_ylim(-1, 1)
+    ax.grid(alpha=0.25)
+
+axes[-1].set_xlabel("Time (s)")
+finish(fig, "fig_waveforms")
+
+
+# ============================================================
+# 14. SPECTROGRAMS
+# ============================================================
+
+mono_rate = sample_rate
+fig, axes = plt.subplots(3, 1, figsize=(11, 9))
+
+for ax, signal, title in zip(axes, signals, titles):
+    s = signal.reshape(-1, channels)[:, 0].astype(np.float64)   # first channel
+    f, t, S = spectrogram(s, fs=mono_rate, nperseg=1024, noverlap=512)
+    im = ax.pcolormesh(t, f / 1000, 10 * np.log10(S + 1e-10),
+                       shading="auto", cmap="magma")
+    ax.set_title(title + " Spectrogram", fontsize=10, fontweight="bold")
+    ax.set_ylabel("Frequency (kHz)")
+    fig.colorbar(im, ax=ax, label="Power (dB)")
+
+axes[-1].set_xlabel("Time (s)")
+finish(fig, "fig_spectrograms")
+
+
+# ============================================================
+# 15. HISTOGRAM VISUALIZATION
+# ============================================================
+
+fig, axes = plt.subplots(3, 1, figsize=(11, 9))
+
+for ax, signal, title in zip(axes, signals, titles):
+    ax.hist(signal, bins=256, range=(-32768, 32768))
+    ax.set_title(title + " Histogram", fontsize=10, fontweight="bold")
+    ax.set_xlabel("Sample Value")
+    ax.set_ylabel("Frequency")
+    ax.set_xlim(-32768, 32767)
+    ax.grid(alpha=0.25)
+
+finish(fig, "fig_histograms")
+
+
+# ============================================================
+# 16. SCATTER PLOTS
+# ============================================================
+
+scatter_rng = np.random.default_rng(12345)
+
+num_points = min(n - 1, 10000)
+pick = np.sort(scatter_rng.choice(n - 1, size=num_points, replace=False))
+
+orig_norm = original_signed.astype(np.float64) / 32768.0
+enc_norm = encrypted_signed.astype(np.float64) / 32768.0
+
+# ---- Figure A: adjacent-sample scatter ----
+fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+
+for ax, values, title, corr in zip(
+    axes, (orig_norm, enc_norm),
+    ("Original Audio", "Encrypted Audio"),
+    (original_corr, encrypted_corr)
+):
+    ax.scatter(values[pick], values[pick + 1], s=2, alpha=0.35)
+    ax.set_title(f"{title}\nCorrelation = {corr:.6f}")
+    ax.set_xlabel("Normalized sample value x[i]")
+    ax.set_ylabel("Normalized sample value x[i+1]")
+    ax.set_xlim(-1, 1)
+    ax.set_ylim(-1, 1)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(alpha=0.25)
+
+finish(fig, "fig_adjacent_scatter")
+
+# ---- Figure B: original vs encrypted ----
+pick_b = np.sort(scatter_rng.choice(n, size=min(n, 10000), replace=False))
+plain_vs_cipher_corr = np.corrcoef(orig_norm, enc_norm)[0, 1]
+
+fig, ax = plt.subplots(figsize=(7, 7))
+ax.scatter(orig_norm[pick_b], enc_norm[pick_b], s=2, alpha=0.35)
+ax.set_title(f"Original vs Encrypted Samples\nCorrelation = {plain_vs_cipher_corr:.6f}")
+ax.set_xlabel("Original sample value (normalized)")
+ax.set_ylabel("Encrypted sample value (normalized)")
+ax.set_xlim(-1, 1)
+ax.set_ylim(-1, 1)
+ax.set_aspect("equal", adjustable="box")
+ax.grid(alpha=0.25)
+finish(fig, "fig_plain_vs_cipher")
+
+print("\n========== SCATTER ANALYSIS ==========")
+print(f"Points plotted                     : {num_points}")
+print(f"Adjacent corr. (original)          : {original_corr:.6f}")
+print(f"Adjacent corr. (encrypted)         : {encrypted_corr:.6f}")
+print(f"Original vs encrypted correlation  : {plain_vs_cipher_corr:.6f}")
+
+
+# ============================================================
+# 17. CHAOTIC SEQUENCE VISUALIZATION
+# ============================================================
+
+display_n = min(n, 3000)
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+axes[0, 0].plot(material["X"][:display_n], linewidth=0.5)
+axes[0, 0].set_title("Chaotic sequence x (first samples)")
+axes[0, 0].set_xlabel("Iteration")
+axes[0, 0].set_ylabel("x")
+
+axes[0, 1].scatter(material["X"][:20000], material["Y"][:20000], s=0.5, alpha=0.4)
+axes[0, 1].set_title("Phase portrait of the key sequence")
+axes[0, 1].set_xlabel("x")
+axes[0, 1].set_ylabel("y")
+axes[0, 1].set_xlim(0, 1)
+axes[0, 1].set_ylim(0, 1)
+
+axes[1, 0].plot(material["K1"][:display_n], linewidth=0.5)
+axes[1, 0].set_title("Diffusion keystream K1 (16-bit)")
+axes[1, 0].set_xlabel("Index")
+axes[1, 0].set_ylabel("Value")
+
+axes[1, 1].scatter(np.arange(display_n), material["P1"][:display_n], s=1)
+axes[1, 1].set_title("High-byte permutation P1")
+axes[1, 1].set_xlabel("Output position")
+axes[1, 1].set_ylabel("Source position")
+
+for ax in axes.ravel():
+    ax.grid(alpha=0.25)
+
+finish(fig, "fig_chaotic_sequences")
+
+
+# ============================================================
+# 18. KEY SENSITIVITY ANALYSIS
+# ============================================================
+# Each trial changes ONE key component by a tiny amount and
+# encrypts the same plaintext again.
+
+DELTA = {"x0": 1e-15, "y0": 1e-15, "a": 1e-14, "b": 1e-14}
+
+
+def perturbed_key(name):
+    k = list(KEY)
+    idx = ["x0", "y0", "a", "b"].index(name)
+    k[idx] += DELTA[name]
+    return tuple(k)
+
+
+def bit_difference(a, b):
+    xor_bytes = (a.view(np.uint16) ^ b.view(np.uint16)).view(np.uint8)
+    return 100.0 * np.unpackbits(xor_bytes).mean()
+
+
+ks_npcr, ks_uaci, ks_bits = [], [], []
+first_modified_cipher = None
+
+print("\n========== KEY SENSITIVITY ==========")
+
+for name in ["x0", "y0", "a", "b"]:
+
+    k2 = perturbed_key(name)
+    modified_cipher, _, _ = encrypt(plain, k2)
+
+    if first_modified_cipher is None:
+        first_modified_cipher = modified_cipher
+
+    ks_npcr.append(npcr(encrypted, modified_cipher))
+    ks_uaci.append(uaci(encrypted, modified_cipher))
+    ks_bits.append(bit_difference(encrypted, modified_cipher))
+
+    print(f"  {name} + {DELTA[name]:.0e} | NPCR = {ks_npcr[-1]:.6f}% | "
+          f"UACI = {ks_uaci[-1]:.6f}% | Bit difference = {ks_bits[-1]:.4f}%")
+
+print("\n---------- Key sensitivity summary (mean +/- std) ----------")
+print(f"NPCR           : {np.mean(ks_npcr):.6f}% +/- {np.std(ks_npcr):.6f}   (ideal about 99.9985%)")
+print(f"UACI           : {np.mean(ks_uaci):.6f}% +/- {np.std(ks_uaci):.6f}   (ideal about 33.334%)")
+print(f"Bit difference : {np.mean(ks_bits):.4f}% +/- {np.std(ks_bits):.4f}   (ideal about 50%)")
+
+
+# ---------- 18.1 Decryption with a slightly wrong key ----------
+
+wrong_key = perturbed_key("x0")
+wrong_decrypted = decrypt(encrypted, DIGEST, wrong_key)
+
+assert not np.array_equal(plain, wrong_decrypted)
+
+wrong_match = 100.0 * np.mean(plain == wrong_decrypted)
+wrong_bit_diff = bit_difference(plain, wrong_decrypted)
+wrong_adj_corr = correlation(wrong_decrypted)
+plain_vs_wrong_corr = np.corrcoef(plain.astype(float), wrong_decrypted.astype(float))[0, 1]
+
+print("\n---------- Decryption with x0 + 1e-15 ----------")
+print(f"Samples matching original          : {wrong_match:.6f}%")
+print(f"Bit difference from original       : {wrong_bit_diff:.4f}%")
+print(f"Adjacent correlation (wrong key)   : {wrong_adj_corr:.6f}")
+print(f"Original vs wrong-key correlation  : {plain_vs_wrong_corr:.6f}")
+
+
+# ---------- 18.2 Key sensitivity waveforms ----------
+
+original_wave = original_signed / 32768.0
+correct_wave = decrypted_signed / 32768.0
+wrong_wave = wrong_decrypted / 32768.0
+
+wave_panels = [
+    (original_wave, "(a) Original Audio", "blue"),
+    (correct_wave, "(b) Correct Key Decryption", "green"),
+    (wrong_wave, "(c) Wrong Key Decryption (x0 + 1e-15)", "red"),
+]
+
+tight_limit = max(1.1 * np.max(np.abs(original_wave)), 1e-3)
+
+fig, axes = plt.subplots(3, 1, figsize=(11, 8.5))
+
+for k, (ax, (wave, title, color)) in enumerate(zip(axes, wave_panels)):
+    ax.plot(time_axis, wave, color=color, linewidth=0.5)
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.set_xlim(0, time_axis[-1])
+    ax.set_ylim(-1, 1) if k == 2 else ax.set_ylim(-tight_limit, tight_limit)
+
+axes[-1].set_xlabel("Time (s)", fontsize=10, fontweight="bold")
+finish(fig, "fig_key_sensitivity_waveforms")
+
+
+# ---------- 18.3 Key sensitivity scatter plots ----------
+
+cipher_1 = encrypted_signed / 32768.0
+cipher_2 = first_modified_cipher / 32768.0
+wrong_norm = wrong_decrypted / 32768.0
+cipher_vs_cipher_corr = np.corrcoef(cipher_1, cipher_2)[0, 1]
+
+key_rng = np.random.default_rng(2026)
+pick_k = np.sort(key_rng.choice(n, size=min(n, 10000), replace=False))
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+
+axes[0].scatter(cipher_1[pick_k], cipher_2[pick_k], s=2, alpha=0.35)
+axes[0].set_title("Ciphertext: Correct Key vs x0 + 1e-15\n"
+                  f"Correlation = {cipher_vs_cipher_corr:.6f}")
+axes[0].set_xlabel("Encrypted sample (correct key)")
+axes[0].set_ylabel("Encrypted sample (changed key)")
+
+axes[1].scatter(wrong_norm[pick], wrong_norm[pick + 1], s=2, alpha=0.35)
+axes[1].set_title(f"Wrong-Key Decrypted Audio\nCorrelation = {wrong_adj_corr:.6f}")
+axes[1].set_xlabel("Normalized sample value x[i]")
+axes[1].set_ylabel("Normalized sample value x[i+1]")
+
+for ax in axes:
+    ax.set_xlim(-1, 1)
+    ax.set_ylim(-1, 1)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(alpha=0.25)
+
+finish(fig, "fig_key_sensitivity_scatter")
+
+
+# ============================================================
+# 19. KEY SPACE
+# ============================================================
+
+key_space_log10 = 15 + 15 + 17 + 17     # x0, y0 (1e-15 steps); a, b in [0,100] (1e-15 steps)
+print("\n========== KEY SPACE ==========")
+print(f"Key space           : about 10^{key_space_log10} = 2^{key_space_log10*math.log2(10):.0f}")
+
+recovered_audio = decrypted.reshape(original_shape)
+
+# No WAV files are saved. Set SAVE_FIGURES = True to save the figures.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
